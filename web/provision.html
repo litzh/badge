@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Badge Wi-Fi 配网</title>
+<style>
+:root{font:16px/1.6 system-ui,sans-serif;color:#142c36;background:#edf2f3}body{margin:0;padding:40px 20px}main{max-width:520px;margin:auto;background:white;border-radius:20px;padding:32px;box-shadow:0 12px 40px #142c3610}h1{margin:0 0 8px;font-size:28px}p{color:#526770}label{display:block;margin:18px 0 6px}input,button{font:inherit;box-sizing:border-box;width:100%;padding:12px;border:1px solid #afbec4;border-radius:8px}button{background:#125568;color:white;cursor:pointer;margin-top:20px;border:0}button:disabled{opacity:.45;cursor:default}input:focus{outline:2px solid #125568}#status{white-space:pre-wrap;overflow-wrap:anywhere;padding:16px;background:#eef5f7;border-radius:8px;margin-top:22px}small{color:#526770}.secondary{background:#e3edef;color:#142c36}footer{margin-top:20px;font-size:13px;color:#526770}
+</style>
+<main>
+<h1>Badge Wi-Fi 配网</h1>
+<p>使用 Mac Chrome 打开本文件。设备联网失败时自动等待配网，或在设备运行时长按 BOOT 三秒（设备屏幕有提示）。</p>
+<button id="connect">选择蓝牙设备</button>
+<form id="form">
+<label for="ssid">Wi-Fi 名称</label><input id="ssid" required autocomplete="off" placeholder="2.4 GHz Wi-Fi">
+<label for="password">Wi-Fi 密码</label><input id="password" type="password" autocomplete="new-password" placeholder="开放网络请留空">
+<small>连接成功后保存配置，下次开机自动使用。</small>
+<button id="submit" disabled>连接并保存</button>
+</form>
+<button id="disconnect" class="secondary" disabled>断开蓝牙</button>
+<div id="status" role="status" aria-live="polite">等待选择设备。</div>
+<footer>此页面无需互联网或外部资源。凭据仅通过蓝牙发给所选设备，不保存在浏览器。若本地文件受限，可通过 localhost 打开。</footer>
+</main>
+<script>
+'use strict';
+const SERVICE='98bf0001-7d56-4f36-913a-2f0743a89c11';
+const WRITE='98bf0002-7d56-4f36-913a-2f0743a89c11';
+const STATUS='98bf0003-7d56-4f36-913a-2f0743a89c11';
+const $=id=>document.getElementById(id);
+const encoder=new TextEncoder(),decoder=new TextDecoder();
+let device,writer,reader,busy=false,polling=false,timer,provisioning=false;
+function show(text){$('status').textContent=text;}
+function buttons(){const connected=!!device?.gatt.connected;$('connect').disabled=connected||busy;$('submit').disabled=!connected||busy||!provisioning;$('disconnect').disabled=!connected||busy;}
+function render(s){
+  provisioning=s.provisioning&&s.state!=='connecting';
+  const results={idle:'等待提交 Wi-Fi。',connecting:'正在连接 Wi-Fi，请等待（最多约 20 秒）…',saved:'连接成功，配置已保存。',connection_failed:'连接失败，原有配置未被覆盖。请检查名称和密码后重试。',save_failed:'Wi-Fi 已连接，但配置保存失败，请重试。',invalid_credentials:'配置格式无效，请检查名称与密码长度。',busy:'设备正在连接，请等待。',provisioning_closed:'配网已关闭。重新配网请长按 BOOT 三秒（设备屏幕有提示）。'};
+  show((results[s.result]||s.state)+(s.ip?'\nIP: '+s.ip+'\nHTTP: http://'+s.ip+'/status':''));
+  buttons();
+}
+async function poll(){
+  if(busy||polling||!reader||!device?.gatt.connected)return;
+  polling=true;
+  try{render(JSON.parse(decoder.decode(await reader.readValue())));}catch(e){show('读取状态失败：'+e.message);}finally{polling=false;}
+}
+$('connect').onclick=async()=>{
+  busy=true;buttons();
+  try{
+    device=await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
+    device.addEventListener('gattserverdisconnected',()=>{clearInterval(timer);writer=reader=null;busy=false;provisioning=false;buttons();show('蓝牙已断开。已保存的 Wi-Fi 配置仍保留在设备中。');});
+    const server=await device.gatt.connect();
+    const service=await server.getPrimaryService(SERVICE);
+    writer=await service.getCharacteristic(WRITE);reader=await service.getCharacteristic(STATUS);
+    show('已连接 '+device.name+'，正在读取状态…');
+    timer=setInterval(poll,1000);
+  }catch(e){if(device?.gatt.connected)device.gatt.disconnect();show('连接失败：'+e.message);}
+  finally{busy=false;buttons();await poll();}
+};
+$('form').onsubmit=async event=>{
+  event.preventDefault();
+  if(busy||!writer||!provisioning)return;
+  const ssid=$('ssid').value,password=$('password').value;
+  const n=encoder.encode(ssid).length,p=encoder.encode(password).length;
+  if(n<1||n>32){show('Wi-Fi 名称必须为 1–32 字节。');return;}
+  if(p!==0&&!(p>=8&&p<=63)&&!(/^[0-9a-fA-F]{64}$/.test(password))){show('密码应为 8–63 字节，或 64 位十六进制；开放网络留空。');return;}
+  busy=true;buttons();show('正在发送配置…');
+  try{
+    // Wait for a status read to finish before starting GATT writes.
+    while(polling)await new Promise(resolve=>setTimeout(resolve,30));
+    await writer.writeValueWithResponse(encoder.encode('\n'));
+    const bytes=encoder.encode(JSON.stringify({ssid,password})+'\n');
+    for(let i=0;i<bytes.length;i+=20)await writer.writeValueWithResponse(bytes.slice(i,i+20));
+    $('password').value='';show('配置已发送，等待设备连接…');
+  }catch(e){show('发送失败：'+e.message);}
+  finally{busy=false;buttons();}
+};
+$('disconnect').onclick=()=>device?.gatt.disconnect();
+if(!window.isSecureContext||!navigator.bluetooth){$('connect').disabled=true;show('当前浏览器无法使用 Web Bluetooth。请用 Mac Chrome 打开文件，或通过 http://localhost 访问。');}
+</script>
+</html>
