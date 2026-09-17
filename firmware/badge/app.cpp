@@ -5,6 +5,10 @@
 // so every row is clipped to the chord width at its y position.
 #include "config.h"
 #include "board_io.h"
+#include "screensaver_state.h"
+#include "microphone.h"
+#include "visualizer.h"
+#include "display_frame.h"
 #include "Arduino_GFX_Library.h"
 #include "pin_config.h"
 #include <WiFi.h>
@@ -21,7 +25,7 @@
 
 namespace {
 
-constexpr char FIRMWARE_VERSION[] = "badge-0.2.0";
+constexpr char FIRMWARE_VERSION[] = "badge-0.4.2";
 
 // Round-screen geometry: 466x466 panel, visible area is the inscribed circle.
 constexpr int16_t SCREEN = 466;
@@ -40,6 +44,35 @@ Preferences displayPrefs;
 bool storageOK = false, displayStorageOK = false;
 uint8_t brightness = 160;
 String displayError;
+ScreensaverState screensaver;
+bool screenDirty = true;
+bool statusNeedsClear = true;
+Arduino_Canvas statusRow(SCREEN, 24, nullptr);
+bool statusRowReady = false;
+uint32_t lastSaverFrame = 0;
+uint32_t lastTouchHandled = 0;
+
+void userActivity() {
+  bool wasActive = screensaver.active;
+  screensaver.activity(millis());
+  if (wasActive)
+    gfx->setBrightness(brightness);
+  if (wasActive) {
+    statusNeedsClear = true;
+    microphoneSetEnabled(false);
+    boardSetVisualActive(false);
+  }
+  screenDirty = screenDirty || wasActive;
+}
+
+void addDisplayState(cJSON *j) {
+  cJSON_AddNumberToObject(j, "brightness", brightness);
+  cJSON_AddNumberToObject(j, "effective_brightness", screensaver.effectiveBrightness(brightness));
+  cJSON_AddNumberToObject(j, "screensaver_brightness_limit", ScreensaverState::BRIGHTNESS_LIMIT);
+  cJSON_AddBoolToObject(j, "screensaver", screensaver.active);
+  cJSON_AddNumberToObject(j, "idle_ms", uint32_t(millis() - screensaver.lastActivity));
+  cJSON_AddNumberToObject(j, "screensaver_timeout_ms", ScreensaverState::TIMEOUT_MS);
+}
 
 bool bleEnabled = false, bleReady = false;
 BLECharacteristic *bleStatus;
@@ -103,14 +136,34 @@ void drawRow(int16_t y, const String &text, uint16_t color, uint8_t size) {
   if (maxChars <= 0)
     return;
   String clipped = (int)text.length() > maxChars ? text.substring(0, maxChars) : text;
-  gfx->setTextSize(size);
-  gfx->setTextColor(color);
-  gfx->setCursor(CENTER - (int)clipped.length() * 6 * size / 2, y);
-  gfx->print(clipped);
+  struct CachedRow { int16_t y = -1; String text; uint16_t color = 0; uint8_t size = 0; };
+  static CachedRow rows[12];
+  CachedRow *cached = nullptr;
+  for (auto &row : rows) {
+    if (row.y == y || row.y == -1) { cached = &row; break; }
+  }
+  if (cached && !statusNeedsClear && cached->y == y && cached->text == clipped &&
+      cached->color == color && cached->size == size) return;
+  if (cached) { cached->y=y; cached->text=clipped; cached->color=color; cached->size=size; }
+  int16_t x = CENTER - (int)clipped.length() * 6 * size / 2;
+  if (statusRowReady) {
+    statusRow.fillScreen(RGB565_BLACK);
+    statusRow.setTextSize(size);
+    statusRow.setTextColor(color);
+    statusRow.setCursor(x, 0);
+    statusRow.print(clipped);
+    presentFrame(gfx, 0, y, statusRow.getFramebuffer(), SCREEN, 8 * size);
+  } else {
+    gfx->fillRect(0, y, SCREEN, 8 * size, RGB565_BLACK);
+    gfx->setTextSize(size);
+    gfx->setTextColor(color);
+    gfx->setCursor(x, y);
+    gfx->print(clipped);
+  }
 }
 
 void drawScreen() {
-  gfx->fillScreen(RGB565_BLACK);
+  if (statusNeedsClear) gfx->fillScreen(RGB565_BLACK);
   drawRow(96, "BADGE", RGB565_CYAN, 3);
   drawRow(140, "State: " + phase, RGB565_WHITE, 2);
   drawRow(168, "SSID: " + (ssid.length() ? ssid : String("--")), RGB565_WHITE, 2);
@@ -133,33 +186,70 @@ void drawScreen() {
     snprintf(touchInfo, sizeof(touchInfo), "Touch: %d, %d", tx, ty);
   drawRow(252, touchInfo, RGB565_YELLOW, 2);
   // Echo message, wrapped row by row inside the circle.
-  if (message.length()) {
-    int y = 280;
+  {
     String rest = message;
-    while (rest.length() && y <= 330) {
+    for (int y = 280; y <= 330; y += 22) {
       int maxChars = maxCharsForRow(y, 2);
       if (maxChars <= 0)
         break;
       String line = rest.substring(0, min((size_t)maxChars, rest.length()));
       rest = rest.substring(line.length());
       drawRow(y, line, RGB565_WHITE, 2);
-      y += 22;
     }
-  }
-  // Visual touch feedback: a dot at the last touch point (kept inside the circle).
-  if (boardTouchPoint(tx, ty, touchAge) && touchAge < 500) {
-    float dx = tx - CENTER, dy = ty - CENTER;
-    if (dx * dx + dy * dy > (float)(RADIUS - 10) * (RADIUS - 10)) {
-      float scale = (RADIUS - 10) / sqrtf(dx * dx + dy * dy);
-      tx = CENTER + (int16_t)(dx * scale);
-      ty = CENTER + (int16_t)(dy * scale);
-    }
-    gfx->fillCircle(tx, ty, 8, RGB565_RED);
   }
   drawRow(352, bleEnabled ? "BLE provisioning: open provision.html"
                           : "Hold BOOT 3s for Wi-Fi setup",
           RGB565_MAGENTA, 2);
+  statusNeedsClear = false;
   lastScreen = millis();
+}
+
+// Sparse moving lights on true black, with no static text or border. Erase
+// only the previous small shapes so idle animation doesn't repaint 466x466.
+void drawScreensaver(bool first) {
+  uint32_t started = millis();
+  if (visualizerDraw(gfx, first)) {
+    lastSaverFrame = started;
+    return;
+  }
+  constexpr int COUNT = 7;
+  static int16_t oldX[COUNT], oldY[COUNT];
+  static uint32_t frame = 0;
+  if (first) {
+    gfx->fillScreen(RGB565_BLACK);
+  } else {
+    for (int i = 0; i < COUNT; ++i)
+      gfx->fillCircle(oldX[i], oldY[i], 7 + i % 3, RGB565_BLACK);
+  }
+  float t = frame++ * 0.1f;
+  for (int i = 0; i < COUNT; ++i) {
+    float angle = t * (0.13f + i * 0.017f) + i * 2.4f;
+    float radius = 35.0f + 150.0f * (0.5f + 0.5f * sinf(t * 0.071f + i * 1.7f));
+    oldX[i] = CENTER + (int16_t)(cosf(angle) * radius);
+    oldY[i] = CENTER + (int16_t)(sinf(angle) * radius);
+    uint8_t r = 45 + (uint8_t)(35 * (1 + sinf(t * 0.19f + i)));
+    uint8_t g = 55 + (uint8_t)(40 * (1 + sinf(t * 0.17f + i + 2)));
+    uint8_t b = 65 + (uint8_t)(40 * (1 + sinf(t * 0.11f + i + 4)));
+    uint16_t color = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+    gfx->fillCircle(oldX[i], oldY[i], 5 + i % 3, color);
+  }
+  lastSaverFrame = millis();
+}
+
+void displayTick() {
+  if (screensaver.tick(millis())) {
+    microphoneSetEnabled(true);
+    boardSetVisualActive(true);
+    gfx->setBrightness(screensaver.effectiveBrightness(brightness));
+    drawScreensaver(true);
+    screenDirty = false;
+  } else if (screensaver.active) {
+    if (millis() - lastSaverFrame >= 67)
+      drawScreensaver(false);
+  } else if (screenDirty || millis() - lastScreen >= 1000) {
+    drawScreen();
+    screenDirty = false;
+  }
 }
 
 void updateBleStatus() {
@@ -273,6 +363,7 @@ bool validCredentials(cJSON *j, String &s, String &p) {
 void networkTick() {
   Packet packet;
   if (xQueueReceive(commands, &packet, 0) == pdTRUE) {
+    userActivity();
     cJSON *j = parseObject(packet.data);
     String s, p;
     if (!bleEnabled)
@@ -358,12 +449,15 @@ String statusJson() {
   cJSON_AddItemToObject(j, "touch", boardTouchStatus());
   cJSON_AddItemToObject(j, "imu", boardImuStatus());
   cJSON_AddItemToObject(j, "buttons", boardButtonsStatus());
+  addDisplayState(cJSON_AddObjectToObject(j, "display"));
+  cJSON_AddItemToObject(j, "microphone", microphoneStatus());
+  cJSON_AddItemToObject(j, "visualizer", visualizerStatus());
   return jsonText(j);
 }
 
 String displayJson() {
   auto *j = cJSON_CreateObject();
-  cJSON_AddNumberToObject(j, "brightness", brightness);
+  addDisplayState(j);
   cJSON_AddBoolToObject(j, "storage_ready", displayStorageOK);
   if (displayError.isEmpty())
     cJSON_AddNullToObject(j, "error");
@@ -379,6 +473,7 @@ bool setBrightness(uint8_t value) {
     return false;
   }
   brightness = value;
+  userActivity();
   gfx->setBrightness(brightness);
   displayError = "";
   return true;
@@ -387,6 +482,7 @@ bool setBrightness(uint8_t value) {
 void httpSetup() {
   http.on("/status", HTTP_GET, [] { http.send(200, "application/json", statusJson()); });
   http.on("/display", HTTP_GET, [] { http.send(200, "application/json", displayJson()); });
+  http.on("/visualizer", HTTP_GET, [] { http.send(200, "application/json", jsonText(visualizerStatus())); });
   http.on("/display/brightness", HTTP_PUT, [] {
     String raw = http.arg("plain");
     if (raw.length() > 128) {
@@ -426,7 +522,8 @@ void httpSetup() {
         return;
       }
     message = text;
-    lastScreen = 0;
+    userActivity();
+    screenDirty = true;
     auto *reply = cJSON_CreateObject();
     cJSON_AddStringToObject(reply, "message", message.c_str());
     http.send(200, "application/json", jsonText(reply));
@@ -448,6 +545,8 @@ void bootButtonTick() {
   static uint32_t pressedAt = 0;
   static bool fired = false;
   bool pressed = digitalRead(0) == LOW;
+  if (pressed)
+    userActivity();
   if (pressed && !pressedAt) {
     pressedAt = millis();
     fired = false;
@@ -486,6 +585,7 @@ void appSetup() {
   gfx->fillScreen(RGB565_BLACK);
   gfx->setBrightness(brightness);
 
+  statusRowReady = statusRow.begin();
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(false);
@@ -512,9 +612,14 @@ void appSetup() {
     enableProvisioning();
   }
   boardIOSetup();
+  visualizerSetup();
+  microphoneSetup();
+  lastPwrPressHandled = boardPwrShortPressCount();
+  lastTouchHandled = boardTouchSequence();
   httpSetup();
   Serial.printf("BADGE %s ready\n", FIRMWARE_VERSION);
-  drawScreen();
+  userActivity();
+  displayTick();
 }
 
 void appLoop() {
@@ -524,6 +629,7 @@ void appLoop() {
     char c = Serial.read();
     if (c == '\n') {
       if (console == "provision") {
+        userActivity();
         enableProvisioning();
       }
       if (console == "status")
@@ -552,13 +658,18 @@ void appLoop() {
   networkTick();
   http.handleClient();
   boardIOTick();
+  uint32_t touchSequence = boardTouchSequence();
+  if (touchSequence != lastTouchHandled) {
+    lastTouchHandled = touchSequence;
+    userActivity();
+    screenDirty = true;
+  }
   // PWR short press cycles screen brightness.
   constexpr uint8_t levels[] = {64, 160, 255};
   uint32_t pwrCount = boardPwrShortPressCount();
-  if (lastPwrPressHandled == 0)
-    lastPwrPressHandled = pwrCount;
   while (lastPwrPressHandled != pwrCount) {
     ++lastPwrPressHandled;
+    userActivity();
     size_t index = 0;
     for (size_t i = 0; i < sizeof(levels); ++i)
       if (levels[i] == brightness)
@@ -566,7 +677,6 @@ void appLoop() {
     setBrightness(levels[(index + 1) % sizeof(levels)]);
     Serial.printf("PWR short press, brightness -> %u\n", brightness);
   }
-  if (millis() - lastScreen >= 1000)
-    drawScreen();
+  displayTick();
   delay(2);
 }

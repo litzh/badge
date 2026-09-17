@@ -75,10 +75,31 @@
   （±4g @250Hz）、CTRL3=0x55（±512dps @224Hz）、CTRL7=0x03（使能 accel+gyro）。
 - 数据：加速度 0x35–0x3A（小端 int16，4/32768 g/LSB），陀螺仪
   0x3B–0x40（512/32768 dps/LSB）。
+- 温度：0x33–0x34，小端有符号 int16 / 256，单位 °C；是芯片内部温度，
+  会受板上发热影响，不能视作室温。v0.4.0 每秒读取，复读高字节检查跨字节更新，
+  无效时报告 null，屏保保留此前色调。
+- 屏保期间 IMU 轮询目标 40ms，正常状态页 200ms；实际间隔受主循环绘屏时间影响。
+- 温度格式参考 [QMI8658A 数据手册](https://files.waveshare.com/upload/5/5f/QMI8658A_Datasheet_Rev_A.pdf)。
+
+### ES7210 麦克风
+
+- v0.4.0 使用 16kHz、16 位、双通道 I2S 输入，MIC1/MIC3，输入增益 24dB。
+- 仅屏保期间持续采集，在独立 FreeRTOS 任务中计算能量，唤醒后关闭采集。
+- 每块选择 RMS 较强的通道分析，避免双麦反相相加抵消。去直流后提取三个宽频段，
+  具体算法见 `firmware/badge/audio_features.h`。
+- `firmware/badge/src/esp_codec_dev` 移植自 RLCD 所用的随附库，保留 Apache-2.0 许可证。
+  ES8311 播放未启用，PA GPIO46 保持低电平。
 
 ### AXP2101 电源
 
 - 电池电压：0x34（高 5 位）/0x35（低 8 位），1mV/LSB；先置 0x68 bit0 使能检测。
+- v0.3.0 同时置 0x30 bit0 启用电池电压 ADC；0x68 bit0 仅为电池检测。
+- 电池存在：0x00 bit3；VBUS 有效输入：0x00 bit5 且 0x01 bit3 为 0。
+- 充放电方向：0x01 的高 3 位，1 为充电、2 为放电、0 为电池待机。
+  低 3 位为充电阶段原始状态码。0xA4 为电量估计，仅在检测到电池且值在 0–100 时上报。
+- 解码参考 [XPowersAXP2101 驱动](https://github.com/lewisxhe/XPowersLib/blob/master/src/XPowersAXP2101.hpp)
+  与 [寄存器定义](https://github.com/lewisxhe/XPowersLib/blob/master/src/REG/AXP2101Constants.h)。
+  电量估计可能需要完整充放电周期学习；本项目不改充电电流、目标电压或电量计校准参数。
 - PWR 短按：INTEN2（0x41）bit3 使能，INTSTS2（0x49）bit3 读状态，写 1 清除。
 - INTSTS/INTEN 寄存器组：0x40/0x41/0x42 使能，0x48/0x49/0x4A 状态。
 

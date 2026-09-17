@@ -22,6 +22,24 @@ esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,FlashMode=qio,PartitionScheme=app3M_
 
 产物在 `build/`。
 
+构建脚本自动通过 uv 加载项目根目录 `.env`，读取 `BADGE_WIFI_SSID` /
+`BADGE_WIFI_PASSWORD`；如果两者均未提供，则兼容旧的 `RLCD_WIFI_SSID` /
+`RLCD_WIFI_PASSWORD`。两套变量不会交叉拼接。生成的 `wifi_defaults.h` 和 `.env`
+均被 Git 忽略；构建产物包含默认网络凭据，不应公开分发。NVS 保存的网络仍优先。
+
+macOS Apple Silicon 若 Arduino 自带的 Intel ctags 报 `Bad CPU type in executable`，
+可在安装 Xcode Command Line Tools 后运行：
+
+```sh
+bash scripts/setup_native_ctags.sh
+bash scripts/build.sh
+```
+
+脚本从 Arduino ctags 固定版本构建本机工具至 `.cache/arduino-ctags`，
+修正旧内部宏名与现代 macOS SDK 的冲突；`build.sh` 自动使用它，不覆盖系统工具。
+v0.4.2 已在 Apple Silicon、ESP32 Arduino Core 3.3.2-cn 上编译并刷入验证。
+macOS 串口通常为 `/dev/cu.usbmodem*`，烧录时替换下方的 Linux 端口名。
+
 ## 烧录
 
 ```sh

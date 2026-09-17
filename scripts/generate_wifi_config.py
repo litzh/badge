@@ -5,8 +5,10 @@ import sys
 
 
 def credentials(env):
-    ssid = env.get("BADGE_WIFI_SSID", "")
-    password = env.get("BADGE_WIFI_PASSWORD", "")
+    # Accept the legacy names in this project's local .env, as a pair only.
+    prefix = "BADGE" if any(k in env for k in ("BADGE_WIFI_SSID", "BADGE_WIFI_PASSWORD")) else "RLCD"
+    ssid = env.get(prefix + "_WIFI_SSID", "")
+    password = env.get(prefix + "_WIFI_PASSWORD", "")
     if "\0" in ssid or "\0" in password:
         raise ValueError("Wi-Fi parameters must not contain NUL")
     if len(ssid.encode("utf-8")) > 32:

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+__REFRESH__
+<title>Badge 电池曲线 · __LABEL__</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#10151e;color:#e4eaf3;font:15px system-ui,sans-serif}main{max-width:1180px;margin:44px auto;padding:0 24px}h1{font-size:30px;margin:8px 0}h2{font-size:17px;margin:0 0 16px}.eyebrow{color:#88a3c2;letter-spacing:2px;font-size:12px}.muted{color:#9babc1;line-height:1.7}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:26px 0}.card,section{border:1px solid #2b3546;background:#18202d;border-radius:14px;padding:20px}.value{font-size:27px;margin-top:8px}section{margin:16px 0}canvas{width:100%;height:245px;display:block}.legend{display:flex;gap:22px;flex-wrap:wrap}.legend span:before{content:'●';margin-right:7px;color:var(--color)}#hover{min-height:26px;font-variant-numeric:tabular-nums}a{color:#7bb5ff}@media(max-width:680px){.cards{grid-template-columns:repeat(2,1fr)}main{margin:24px auto;padding:0 14px}.value{font-size:22px}}
+</style>
+<main>
+<div class="eyebrow">BADGE / BATTERY LAB</div>
+<h1>__LABEL__</h1>
+<div id="meta" class="muted"></div>
+<div class="cards">
+ <div class="card"><div class="muted">最新电压</div><div class="value" id="voltage">—</div></div>
+ <div class="card"><div class="muted">PMU 估算电量</div><div class="value" id="percent">—</div></div>
+ <div class="card"><div class="muted">记录时长</div><div class="value" id="duration">—</div></div>
+ <div class="card"><div class="muted">有效电压 / 总采样</div><div class="value" id="count">—</div></div>
+</div>
+<div class="legend muted"><span style="--color:#ffb26b">充电</span><span style="--color:#62d7bd">放电</span><span style="--color:#b29aef">电池待机</span><span style="--color:#9babc1">状态未知</span></div>
+<section><h2>电池电压 · V</h2><canvas id="v"></canvas></section>
+<section><h2>电量估计 · %</h2><canvas id="p"></canvas></section>
+<div id="hover" class="muted">将鼠标移到曲线上查看采样详情。</div>
+<section><h2>测试状态</h2><div id="status" class="muted"></div></section>
+<p class="muted">电压和 PMU 电量用于观察趋势，不代表实测充电电流或容量。断连不等于电池耗尽，曲线缺口表示无有效数据、设备重启或采样中断。本测试测量的是 Wi-Fi 在线、屏保运行且持续轮询时的续航，并非深度睡眠续航。</p>
+</main>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+const {samples,metadata,running}=JSON.parse(document.getElementById('data').textContent);
+const colors={charging:'#ffb26b',discharging:'#62d7bd',standby:'#b29aef'};
+const names={charging:'充电',discharging:'放电',standby:'电池待机'};
+const last=samples.at(-1), valid=samples.filter(s=>Number.isFinite(s.voltage_v));
+const text=(id,value)=>document.getElementById(id).textContent=value;
+const duration=s=>s<3600?`${(s/60).toFixed(1)} 分钟`:`${(s/3600).toFixed(2)} 小时`;
+const yes=v=>v===true?'是':v===false?'否':'未知';
+text('meta',`${metadata.device} · ${running?'记录中 · 页面每 10 秒刷新':'记录已停止'} · 采样间隔 ${metadata.interval} 秒`);
+if(last){
+ text('voltage',Number.isFinite(last.voltage_v)?`${last.voltage_v.toFixed(3)} V`:'不可用');
+ text('percent',Number.isFinite(last.percent)?`${last.percent}%`:'不可用');
+ text('duration',duration(last.elapsed_seconds));
+ text('count',`${valid.length} / ${samples.length}`);
+ const first=valid[0],latest=valid.at(-1),failures=samples.filter(s=>!s.reachable).length;
+ text('status',`最新采样：${new Date(last.timestamp_utc).toLocaleString()}；设备在线：${yes(last.reachable)}；USB 供电：${yes(last.vbus_present)}；${names[last.power_state]||'电池状态未知'}；屏保：${yes(last.screensaver)}；实际亮度：${last.effective_brightness??'未知'}。连接失败 ${failures} 次，检测到设备运行时间回退 ${samples.filter(s=>s.reboot_detected).length} 次。${first?` 首个有效电压 ${first.voltage_v.toFixed(3)} V，末个有效电压 ${latest.voltage_v.toFixed(3)} V。`:''}${last.error?` 最新错误：${last.error}`:''}`);
+}else{text('status','等待第一次采样。')}
+const xmax=Math.max(60,last?.elapsed_seconds||0);
+const unit=xmax>=3600?3600:60, unitName=unit===3600?'小时':'分钟';
+function chart(id,field,fixed){
+ const canvas=document.getElementById(id),ctx=canvas.getContext('2d');
+ const w=canvas.clientWidth,h=245,dpr=window.devicePixelRatio||1;
+ canvas.width=w*dpr;canvas.height=h*dpr;ctx.scale(dpr,dpr);
+ const left=58,right=16,top=18,bottom=34,pw=w-left-right,ph=h-top-bottom;
+ const values=samples.map(s=>s[field]).filter(Number.isFinite);
+ let lo=fixed?.[0]??Infinity,hi=fixed?.[1]??-Infinity;
+ if(!fixed){for(const n of values){lo=Math.min(lo,n);hi=Math.max(hi,n)}if(!values.length){lo=3;hi=4.3}else{const pad=Math.max(.025,(hi-lo)*.15);lo-=pad;hi+=pad}}
+ const x=s=>left+s.elapsed_seconds/xmax*pw,y=n=>top+(hi-n)/(hi-lo)*ph;
+ ctx.font='12px system-ui';ctx.fillStyle='#9babc1';ctx.lineWidth=1;
+ for(let i=0;i<=4;i++){
+  const yy=top+i*ph/4;ctx.strokeStyle='#303b4d';ctx.beginPath();ctx.moveTo(left,yy);ctx.lineTo(w-right,yy);ctx.stroke();
+  ctx.fillText((hi-(hi-lo)*i/4).toFixed(fixed?0:2),5,yy+4);
+  const xx=left+i*pw/4;ctx.fillText((xmax*i/4/unit).toFixed(1),xx-8,h-10);
+ }
+ ctx.fillText(unitName,w-42,h-10);
+ let prev=null;
+ for(const s of samples){
+  const value=s[field];if(!Number.isFinite(value)){prev=null;continue}
+  ctx.strokeStyle=colors[s.power_state]||'#9babc1';ctx.fillStyle=ctx.strokeStyle;ctx.lineWidth=2;
+  if(prev&&!s.reboot_detected&&s.elapsed_seconds-prev.elapsed_seconds<=metadata.interval*2.5){ctx.beginPath();ctx.moveTo(x(prev),y(prev[field]));ctx.lineTo(x(s),y(value));ctx.stroke()}
+  ctx.beginPath();ctx.arc(x(s),y(value),1.6,0,Math.PI*2);ctx.fill();prev=s;
+ }
+ if(!values.length){ctx.fillStyle='#9babc1';ctx.fillText(field==='percent'?'尚无电量估计数据（旧固件或 PMU 不可用）':'尚无有效电压数据',left+12,top+ph/2)}
+ canvas.onmousemove=e=>{
+  if(!samples.length)return;
+  const seconds=Math.max(0,(e.clientX-canvas.getBoundingClientRect().left-left)/pw*xmax);
+  let lo=0,hi=samples.length-1;
+  while(lo<hi){const mid=(lo+hi)>>1;if(samples[mid].elapsed_seconds<seconds)lo=mid+1;else hi=mid}
+  let s=samples[lo];if(lo>0&&Math.abs(samples[lo-1].elapsed_seconds-seconds)<Math.abs(s.elapsed_seconds-seconds))s=samples[lo-1];
+  text('hover',`${new Date(s.timestamp_utc).toLocaleString()} · ${duration(s.elapsed_seconds)} · ${s.voltage_v??'—'} V · ${s.percent??'—'}% · ${names[s.power_state]||'未知'} · USB：${yes(s.vbus_present)} · 屏保：${yes(s.screensaver)}${s.error?' · '+s.error:''}`);
+ };
+}
+function draw(){chart('v','voltage_v');chart('p','percent',[0,100])}draw();window.addEventListener('resize',draw);
+</script>
+</html>

@@ -21,6 +21,10 @@ constexpr uint8_t AXP_REG_INTEN2 = 0x41;      // IRQ enable group 2
 constexpr uint8_t AXP_REG_INTSTS2 = 0x49;     // IRQ status group 2
 constexpr uint8_t AXP_INT_PWR_SHORT = 0x08;   // POWERON short press, bit 11 overall
 constexpr uint8_t AXP_REG_BAT_DET = 0x68;     // battery detection control
+constexpr uint8_t AXP_REG_ADC_CHANNEL = 0x30;
+constexpr uint8_t AXP_REG_STATUS1 = 0x00;
+constexpr uint8_t AXP_REG_STATUS2 = 0x01;
+constexpr uint8_t AXP_REG_BAT_PERCENT = 0xA4;
 
 // QMI8658 registers.
 constexpr uint8_t QMI_REG_WHOAMI = 0x00;
@@ -69,12 +73,26 @@ bool i2cWriteReg(uint8_t addr, uint8_t reg, uint8_t value) {
 // ---------------------------------------------------------------- Battery --
 uint16_t batteryMv = 0;
 bool batteryOK = false;
+bool powerStatusOK = false, batteryPresent = false, vbusPresent = false;
+uint8_t powerDirection = 0, chargerStatus = 0;
+int batteryPercent = -1;
 uint32_t lastBattery = 0;
 
 void sampleBattery() {
-  uint8_t v[2];
-  batteryOK = i2cRead(AXP2101_ADDR, AXP_REG_VBAT_H, v, 1) &&
-              i2cRead(AXP2101_ADDR, AXP_REG_VBAT_L, v + 1, 1);
+  uint8_t status1 = 0, status2 = 0, percent = 0, v[2];
+  // Read-only telemetry, following XPowersAXP2101 status/percent decoding.
+  // Do not change charging current, voltage limits or fuel-gauge calibration.
+  powerStatusOK = i2cRead(AXP2101_ADDR, AXP_REG_STATUS1, &status1, 1) &&
+                  i2cRead(AXP2101_ADDR, AXP_REG_STATUS2, &status2, 1);
+  batteryPresent = powerStatusOK && (status1 & 0x08);
+  vbusPresent = powerStatusOK && (status1 & 0x20) && !(status2 & 0x08);
+  powerDirection = status2 >> 5;
+  chargerStatus = status2 & 0x07;
+  batteryPercent = batteryPresent &&
+                           i2cRead(AXP2101_ADDR, AXP_REG_BAT_PERCENT, &percent, 1) &&
+                           percent <= 100
+                       ? percent : -1;
+  batteryOK = batteryPresent && i2cRead(AXP2101_ADDR, AXP_REG_VBAT_H, v, 2);
   if (batteryOK)
     batteryMv = ((v[0] & 0x1F) << 8) | v[1]; // 1 mV per LSB
   lastBattery = millis();
@@ -85,6 +103,7 @@ bool touchOnline = false;
 bool touchPressed = false;
 int16_t touchX = 0, touchY = 0;
 uint32_t lastTouch = 0;
+uint32_t touchSequence = 0;
 volatile bool touchIrqPending = false;
 
 void IRAM_ATTR onTouchIrq() { touchIrqPending = true; }
@@ -161,6 +180,7 @@ void touchPoll() {
     touchY = 465 - y;
     touchPressed = true;
     lastTouch = millis();
+    ++touchSequence;
   } else {
     touchPressed = false;
   }
@@ -171,6 +191,23 @@ bool imuOnline = false;
 float accelG[3] = {0, 0, 0};
 float gyroDps[3] = {0, 0, 0};
 uint32_t lastImu = 0, lastImuSample = 0;
+uint32_t imuInterval = 200, lastTemperature = 0, lastTemperatureAttempt = 0;
+bool temperatureOK = false;
+float temperatureC = 0;
+
+void temperatureSample() {
+  // QMI8658 TEMP_L/H (0x33/0x34), signed 16-bit, 1/256 degree C.
+  // Confirm high byte across the burst to reject rollover while reading.
+  uint8_t raw[2], high;
+  temperatureOK = i2cRead(QMI8658_ADDR, 0x33, raw, 2) &&
+                  i2cRead(QMI8658_ADDR, 0x34, &high, 1) && high == raw[1];
+  if (temperatureOK) {
+    temperatureC = (int16_t)(raw[0] | (raw[1] << 8)) / 256.0f;
+    temperatureOK = temperatureC >= -40 && temperatureC <= 85;
+    if (temperatureOK) lastTemperature = millis();
+  }
+  lastTemperatureAttempt = millis();
+}
 
 bool imuSetup() {
   uint8_t id;
@@ -230,6 +267,8 @@ void boardIOSetup() {
   uint8_t value;
   if (i2cRead(AXP2101_ADDR, AXP_REG_BAT_DET, &value, 1))
     i2cWriteReg(AXP2101_ADDR, AXP_REG_BAT_DET, value | 0x01);
+  if (i2cRead(AXP2101_ADDR, AXP_REG_ADC_CHANNEL, &value, 1))
+    i2cWriteReg(AXP2101_ADDR, AXP_REG_ADC_CHANNEL, value | 0x01);
   if (i2cRead(AXP2101_ADDR, AXP_REG_INTEN2, &value, 1))
     i2cWriteReg(AXP2101_ADDR, AXP_REG_INTEN2, value | AXP_INT_PWR_SHORT);
   i2cWriteReg(AXP2101_ADDR, AXP_REG_INTSTS2, AXP_INT_PWR_SHORT); // clear stale flag
@@ -241,6 +280,7 @@ void boardIOSetup() {
   imuOnline = imuSetup();
   if (imuOnline)
     imuSample();
+  temperatureSample();
 }
 
 void boardIOTick() {
@@ -251,10 +291,12 @@ void boardIOTick() {
     touchIrqPending = false;
     touchPoll();
   }
-  if (now - lastImuSample >= 200) {
+  if (now - lastImuSample >= imuInterval) {
     lastImuSample = now;
     imuSample();
   }
+  if (now - lastTemperatureAttempt >= 1000)
+    temperatureSample();
   if (now - lastPwrPoll >= 200) {
     lastPwrPoll = now;
     pwrPoll();
@@ -263,12 +305,36 @@ void boardIOTick() {
 
 cJSON *boardBatteryStatus() {
   cJSON *b = cJSON_CreateObject();
-  cJSON_AddStringToObject(b, "status", batteryOK ? "ok" : "read_failed");
+  cJSON_AddStringToObject(b, "status", batteryOK ? "ok" :
+                         powerStatusOK && !batteryPresent ? "not_connected" : "read_failed");
   if (batteryOK)
     cJSON_AddNumberToObject(b, "voltage_v", batteryMv / 1000.0);
   else
     cJSON_AddNullToObject(b, "voltage_v");
   cJSON_AddNumberToObject(b, "sample_age_ms", millis() - lastBattery);
+  if (powerStatusOK) {
+    cJSON_AddBoolToObject(b, "present", batteryPresent);
+    cJSON_AddBoolToObject(b, "vbus_present", vbusPresent);
+    if (batteryPresent) {
+      const char *direction = powerDirection == 1 ? "charging" :
+                              powerDirection == 2 ? "discharging" :
+                              powerDirection == 0 ? "standby" : "unknown";
+      cJSON_AddStringToObject(b, "power_state", direction);
+      cJSON_AddNumberToObject(b, "charger_status_code", chargerStatus);
+    } else {
+      cJSON_AddNullToObject(b, "power_state");
+      cJSON_AddNullToObject(b, "charger_status_code");
+    }
+  } else {
+    cJSON_AddNullToObject(b, "present");
+    cJSON_AddNullToObject(b, "vbus_present");
+    cJSON_AddNullToObject(b, "power_state");
+    cJSON_AddNullToObject(b, "charger_status_code");
+  }
+  if (batteryPercent >= 0)
+    cJSON_AddNumberToObject(b, "percent", batteryPercent);
+  else
+    cJSON_AddNullToObject(b, "percent");
   return b;
 }
 
@@ -305,6 +371,11 @@ cJSON *boardImuStatus() {
     }
   }
   cJSON_AddNumberToObject(m, "sample_age_ms", millis() - lastImu);
+  cJSON_AddStringToObject(m, "temperature_status", temperatureOK ? "ok" : "read_failed");
+  if (temperatureOK) cJSON_AddNumberToObject(m, "temperature_c", temperatureC);
+  else cJSON_AddNullToObject(m, "temperature_c");
+  if (lastTemperature) cJSON_AddNumberToObject(m, "temperature_sample_age_ms", uint32_t(millis() - lastTemperature));
+  else cJSON_AddNullToObject(m, "temperature_sample_age_ms");
   return m;
 }
 
@@ -327,6 +398,18 @@ bool boardTouchPoint(int16_t &x, int16_t &y, uint32_t &ageMs) {
 }
 
 uint32_t boardPwrShortPressCount() { return pwrShortPressCount; }
+uint32_t boardTouchSequence() { return touchSequence; }
+
+void boardSetVisualActive(bool active) { imuInterval = active ? 40 : 200; }
+
+BoardMotion boardMotion() {
+  BoardMotion m;
+  m.valid = imuOnline && uint32_t(millis() - lastImu) < 500;
+  if (m.valid) { m.ax = accelG[0]; m.ay = accelG[1]; m.az = accelG[2]; m.gz = gyroDps[2]; }
+  m.temperatureValid = temperatureOK && uint32_t(millis() - lastTemperature) < 5000;
+  if (m.temperatureValid) m.temperatureC = temperatureC;
+  return m;
+}
 
 bool boardBattery(uint16_t &mv, bool &ok) {
   mv = batteryMv;

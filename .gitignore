@@ -1,2 +1,7 @@
 build/
 firmware/badge/wifi_defaults.h
+.env
+recordings/
+__pycache__/
+.cache/
+validation-output/
