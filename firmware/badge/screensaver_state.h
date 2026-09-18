@@ -10,12 +10,17 @@ struct ScreensaverState {
   uint32_t lastActivity = 0;
   bool active = false;
   bool screenOff = false;
+  bool manualOff = false;
 
   void activity(uint32_t now) {
     lastActivity = now;
     active = false;
     screenOff = false;
+    manualOff = false;
   }
+  void sleep() { active = false; screenOff = manualOff = true; }
+  // A voice state change must never undo an explicit screen-off action.
+  void keepAwake(uint32_t now) { if (!screenOff && !active) lastActivity = now; }
   bool tick(uint32_t now, bool lowBattery = false) {
     if (screenOff) return false;
     uint32_t idle = uint32_t(now - lastActivity);

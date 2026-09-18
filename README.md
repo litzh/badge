@@ -4,14 +4,14 @@
 
 ## 当前状态
 
-固件 `badge-0.6.1`（参考 RLCD 项目移植）：Wi-Fi 配网（NVS / 构建期默认 /
+固件 `badge-0.7.0`（参考 RLCD 项目移植）：Wi-Fi 配网（NVS / 构建期默认 /
 BLE）、HTTP API、状态屏均已验证。板载设备全部在线：CO5300 AMOLED、
 CST9217 触摸（中断驱动）、QMI8658 IMU、AXP2101 电池/电源键、ES8311/ES7210
 音频（ES7210 麦克风采集、ES8311 扬声器播放）。
 
-新增设备语音问答：点击状态页底部开始/结束录音，经过 MiniMax ASR、DeepSeek Flash
+新增设备语音问答：短按 BOOT 开始/结束录音，处理或播放时短按取消，经过 MiniMax ASR、DeepSeek Flash
 （按需服务端搜索）和 MiniMax TTS 后播放简短回答。密钥、音色与 TXT 系统提示词在构建时注入，
-默认音色 `male-qn-qingse`；屏幕 `[-] / [+]` 调节音量并保存，重启保留。详见 [语音问答与构建参数](docs/voice.md)。
+PWR 短按亮屏/熄屏；触屏按钮按下高亮、松开执行。默认音色 `male-qn-qingse`；Settings 页 `[-] / [+]` 调节音量并保存，重启保留。详见 [语音问答与构建参数](docs/voice.md)。
 
 每次连上 Wi-Fi 后自动通过 `ntp1.aliyun.com` / `ntp1.tencent.com` 校时，
 状态页顶部显示北京时间；联网期间每小时同步，失败每 60 秒交换服务器优先级重试。

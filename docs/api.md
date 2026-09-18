@@ -1,6 +1,6 @@
 # Badge HTTP API
 
-固件 `badge-0.6.0`。所有接口在 80 端口，JSON 请求体**必须带
+固件 `badge-0.7.0`。所有接口在 80 端口，JSON 请求体**必须带
 `Content-Type: application/json`**，否则 ESP32 WebServer 会按表单解析导致
 `plain` 体为空（错误信息会有误导性）。
 
@@ -8,7 +8,7 @@
 
 ```json
 {
-  "firmware": "badge-0.6.0",
+  "firmware": "badge-0.7.0",
   "uptime_seconds": 117,
   "free_heap_bytes": 227708,
   "free_psram_bytes": 8372404,
@@ -156,6 +156,9 @@
 }
 ```
 
+`page` 为 `home` / `settings` / `info`；`manual_off` 标记 PWR 手动熄屏，
+`touch_button_pressed` 表示当前捕获了一个可用触屏按钮。
+
 `brightness` 是保存的正常亮度；`effective_brightness` 是当前实际面板设置。
 屏保时取正常亮度与 128 的较小值，不修改 NVS。读取本接口不唤醒。
 v0.4.2 将上限从 24 调整为 128，修复实际面板上粒子几乎不可见的问题。
@@ -178,14 +181,14 @@ v0.4.2 将上限从 24 调整为 128，修复实际面板上粒子几乎不可�
 - BLE 服务 UUID 与 RLCD 项目相同，设备名 `BADGE-xxxx`，配网页面
   `web/provision.html`（Mac Chrome 打开）。
 - 凭据**连接成功才保存**，失败不覆盖旧配置。
-- 运行中长按 BOOT 3 秒重新开放 BLE 配网。
+- 运行中在 Settings 点击 Wi-Fi setup 重新开放 BLE 配网。
 - 串口控制台命令：`provision` / `status` / `scan`。
 
 ## 按键
 
-- **BOOT**（GPIO0，按住为低）：长按 3 秒开放 BLE 配网。
-- **PWR** 短按：循环切换屏幕亮度（64 → 160 → 255）。
+- **BOOT**（GPIO0，按住为低）：短按控制录音开始/提交/取消，按住不重复。
+- **PWR** 短按：切换亮屏/熄屏，不修改亮度；亮度移至 Settings。
 - PWR 长按为硬件电源路径控制（AXP2101），不由固件接管。
 
-触摸、BOOT 按下、PWR 短按均唤醒屏保；PWR 短按仍执行亮度循环。
+屏保/熄屏时首次触摸只唤醒，BOOT 可直接唤醒并开始录音。PWR 手动熄屏后问答继续，状态变化不自动唤醒。
 屏保与测试程序说明见 [battery-monitor.md](battery-monitor.md)。

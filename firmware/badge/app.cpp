@@ -11,6 +11,7 @@
 #include "display_frame.h"
 #include "time_sync.h"
 #include "voice.h"
+#include "interaction.h"
 #include "Arduino_GFX_Library.h"
 #include "pin_config.h"
 #include <WiFi.h>
@@ -27,7 +28,7 @@
 
 namespace {
 
-constexpr char FIRMWARE_VERSION[] = "badge-0.6.1";
+constexpr char FIRMWARE_VERSION[] = "badge-0.7.0";
 
 // Round-screen geometry: 466x466 panel, visible area is the inscribed circle.
 constexpr int16_t SCREEN = 466;
@@ -55,11 +56,30 @@ bool powerOffAttempted = false;
 bool screenDirty = true;
 bool statusNeedsClear = true;
 Arduino_Canvas statusRow(SCREEN, 24, nullptr);
+Arduino_Canvas buttonCanvas(280, 64, nullptr);
 bool statusRowReady = false;
+bool buttonCanvasReady = false;
 uint32_t lastSaverFrame = 0;
-uint32_t lastTouchHandled = 0;
-uint32_t lastTapHandled = 0, lastVoiceTap = 0;
 bool voiceWasBusy = false;
+using BadgeUI::Page;
+using BadgeUI::Control;
+Page page = Page::Home;
+BadgeUI::Touch touch;
+BadgeUI::BootButton bootButton;
+BadgeUI::VoiceAction touchVoiceAction = BadgeUI::VoiceAction::Start;
+Control feedbackButton = Control::None;
+uint32_t feedbackUntil = 0, noticeUntil = 0;
+String notice;
+
+String ascii(const String &s);
+bool controlEnabled(Control id);
+void activateControl(Control id);
+void performVoiceAction(BadgeUI::VoiceAction action);
+void showPage(Page next) {
+  page = next; touch.cancel(); feedbackButton = Control::None;
+  statusNeedsClear = screenDirty = true;
+}
+void showNotice(const String &text) { notice = text; noticeUntil = millis() + 2500; screenDirty = true; }
 
 uint8_t effectiveBrightness() {
   uint8_t value = screensaver.effectiveBrightness(brightness);
@@ -87,6 +107,7 @@ void userActivity() {
   if (wasActive)
     gfx->setBrightness(effectiveBrightness());
   if (wasActive) {
+    showPage(Page::Home);
     statusNeedsClear = true;
     microphoneSetEnabled(false);
     boardSetVisualActive(false);
@@ -100,6 +121,9 @@ void addDisplayState(cJSON *j) {
   cJSON_AddNumberToObject(j, "screensaver_brightness_limit", ScreensaverState::BRIGHTNESS_LIMIT);
   cJSON_AddBoolToObject(j, "screensaver", screensaver.active);
   cJSON_AddBoolToObject(j, "screen_off", screensaver.screenOff);
+  cJSON_AddBoolToObject(j, "manual_off", screensaver.manualOff);
+  cJSON_AddStringToObject(j, "page", page == Page::Home ? "home" : page == Page::Settings ? "settings" : "info");
+  cJSON_AddBoolToObject(j, "touch_button_pressed", touch.captured != Control::None);
   cJSON_AddStringToObject(j, "mode", screensaver.screenOff ? "off" : screensaver.active ? "screensaver" : "status");
   cJSON_AddNumberToObject(j, "screensaver_max_display_ms", ScreensaverState::MAX_DISPLAY_MS);
   cJSON_AddNumberToObject(j, "idle_ms", uint32_t(millis() - screensaver.lastActivity));
@@ -205,7 +229,7 @@ void drawRow(int16_t y, const String &text, uint16_t color, uint8_t size) {
     return;
   String clipped = (int)text.length() > maxChars ? text.substring(0, maxChars) : text;
   struct CachedRow { int16_t y = -1; String text; uint16_t color = 0; uint8_t size = 0; };
-  static CachedRow rows[14];
+  static CachedRow rows[32];
   CachedRow *cached = nullptr;
   for (auto &row : rows) {
     if (row.y == y || row.y == -1) { cached = &row; break; }
@@ -230,60 +254,105 @@ void drawRow(int16_t y, const String &text, uint16_t color, uint8_t size) {
   }
 }
 
+String voiceTitle() {
+  String state = voiceLabel();
+  if (state == "recording") return "LISTENING";
+  if (state == "recognizing") return "RECOGNIZING";
+  if (state == "thinking" || state == "shortening") return "THINKING";
+  if (state == "synthesizing" || state == "downloading") return "PREPARING AUDIO";
+  if (state == "playing") return "SPEAKING";
+  if (state == "starting") return "STARTING";
+  if (state == "error") return "TRY AGAIN";
+  return "READY";
+}
+
+String voiceHint() {
+  String error = voiceError();
+  if (error.isEmpty()) return "Press BOOT to talk";
+  if (error == "wifi_not_connected") return "Wi-Fi offline: open Settings";
+  if (error == "waiting_for_ntp") return "Waiting for network time";
+  if (error == "no_speech_recognized") return "No speech heard. Try again";
+  if (error == "recording_too_short") return "Speak a little longer";
+  if (error == "keys_or_prompt_missing") return "Voice setup missing";
+  return "Voice failed: see Info";
+}
+
+void drawButton(const BadgeUI::Button &b, const String &label) {
+  bool enabled = controlEnabled(b.id);
+  bool pressed = enabled && (touch.captured == b.id || feedbackButton == b.id);
+  uint16_t edge = !enabled ? 0x52AA : pressed ? RGB565_WHITE : RGB565_CYAN;
+  uint16_t fill = !enabled ? 0x1082 : pressed ? 0x2576 : 0x1125;
+  uint16_t ink = !enabled ? 0x7BEF : RGB565_WHITE;
+  struct Cache { Page page; Control id = Control::None; String label; bool enabled = false, pressed = false; };
+  static Cache cache[10];
+  Cache *entry = nullptr;
+  for (auto &item : cache) if (item.id == Control::None || (item.id == b.id && item.page == b.page)) { entry = &item; break; }
+  if (entry && !statusNeedsClear && entry->id == b.id && entry->page == b.page && entry->label == label &&
+      entry->enabled == enabled && entry->pressed == pressed) return;
+  if (entry) { entry->page = b.page; entry->id = b.id; entry->label = label; entry->enabled = enabled; entry->pressed = pressed; }
+  Arduino_GFX *target = buttonCanvasReady ? static_cast<Arduino_GFX *>(&buttonCanvas) : gfx;
+  int x = buttonCanvasReady ? 0 : b.x, y = buttonCanvasReady ? 0 : b.y;
+  if (buttonCanvasReady) buttonCanvas.fillScreen(RGB565_BLACK);
+  target->fillRoundRect(x, y, b.w, b.h, 12, fill);
+  target->drawRoundRect(x, y, b.w, b.h, 12, edge);
+  target->drawRoundRect(x + 1, y + 1, b.w - 2, b.h - 2, 11, edge);
+  target->setTextSize(2); target->setTextColor(ink);
+  target->setCursor(x + (b.w - label.length() * 12) / 2, y + (b.h - 16) / 2);
+  target->print(label);
+  if (buttonCanvasReady) {
+    // Canvas stride is 280; narrower buttons must be transferred row by row.
+    auto *pixels = buttonCanvas.getFramebuffer();
+    for (int row = 0; row < b.h; ++row) gfx->draw16bitRGBBitmap(b.x, b.y + row, pixels + row * 280, b.w, 1);
+  }
+}
+
 void drawScreen() {
   if (statusNeedsClear) gfx->fillScreen(RGB565_BLACK);
-  drawRow(68, timeSyncDisplay(), RGB565_WHITE, 2);
-  drawRow(96, "BADGE", RGB565_CYAN, 3);
-  drawRow(126, bleEnabled ? "BLE setup: open provision.html" : "Hold BOOT 3s for Wi-Fi setup", RGB565_MAGENTA, 1);
-  drawRow(140, "State: " + phase, RGB565_WHITE, 2);
-  drawRow(168, "SSID: " + (ssid.length() ? ssid : String("--")), RGB565_WHITE, 2);
-  String ip = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("--");
-  drawRow(196, "IP: " + ip + "  HTTP:80", RGB565_GREEN, 2);
-  char bat[48];
-  uint16_t mv;
-  bool batOK;
-  boardBattery(mv, batOK);
-  BatterySample sample = boardBatterySample();
-  if (batOK && sample.percent >= 0)
-    snprintf(bat, sizeof(bat), "Battery: %d%%  %.2f V", sample.percent, mv / 1000.0f);
-  else if (batOK)
-    snprintf(bat, sizeof(bat), "Battery: --%%  %.2f V", mv / 1000.0f);
-  else
-    snprintf(bat, sizeof(bat), "Battery: --");
-  drawRow(224, bat, batteryPolicy.conserve() ? RGB565_RED : RGB565_YELLOW, 2);
-  int16_t tx;
-  int16_t ty;
-  uint32_t touchAge;
-  char touchInfo[48] = "Touch: --";
-  if (boardTouchPoint(tx, ty, touchAge) && touchAge < 60000)
-    snprintf(touchInfo, sizeof(touchInfo), "Touch: %d, %d", tx, ty);
-  const char *batteryHint = nullptr;
-  if (batteryPolicy.cutoffPending) batteryHint = "LOW VOLTAGE - CONNECT USB";
-  else if (batteryPolicy.low) batteryHint = "LOW BATTERY - CONNECT USB";
-  else if (sample.powerValid && sample.vbus) {
-    batteryHint = sample.direction == 1 ? "Charging" :
-                  sample.percent == 100 && sample.chargerStatus == 4 ? "Fully charged - USB" : "USB power";
+  if (page == Page::Home) {
+    drawRow(58, timeSyncDisplay(), RGB565_WHITE, 2);
+    auto battery = boardBatterySample();
+    String power = battery.percent >= 0 ? String(battery.percent) + "%" : "--%";
+    if (battery.powerValid && battery.vbus) power += " USB";
+    if (batteryPolicy.conserve()) power += " LOW";
+    drawRow(94, String(WiFi.status() == WL_CONNECTED ? "Wi-Fi OK   " : "OFFLINE   ") + power, RGB565_YELLOW, 2);
+    drawRow(156, voiceTitle(), voiceRecording() ? RGB565_RED : RGB565_CYAN, 3);
+    String detail = voiceRecording() ? String("Recording: ") + voiceRecordedMs() / 1000 + "s" :
+                    !notice.isEmpty() ? notice : voiceBusy() ? "Please wait..." : voiceHint();
+    drawRow(204, detail, RGB565_WHITE, 2);
+    drawRow(234, voiceRecording() ? "BOOT: send" : voiceBusy() ? "BOOT: cancel" : "BOOT: start recording", RGB565_WHITE, 2);
+    drawRow(420, "PWR: screen on/off", RGB565_WHITE, 1);
+  } else if (page == Page::Settings) {
+    drawRow(64, "SETTINGS", RGB565_CYAN, 3);
+    drawRow(106, notice.isEmpty() ? "Touch a button" : notice, RGB565_WHITE, 2);
+    drawRow(128, String("Volume: ") + voiceVolume() + (voiceVolume() == 0 ? " (muted)" : ""), RGB565_WHITE, 2);
+    drawRow(224, String("Brightness: ") + brightness, RGB565_WHITE, 2);
+  } else {
+    drawRow(64, "DEVICE INFO", RGB565_CYAN, 3);
+    drawRow(110, FIRMWARE_VERSION, RGB565_WHITE, 2);
+    drawRow(148, "Wi-Fi: " + phase, RGB565_WHITE, 2);
+    drawRow(180, "SSID: " + ascii(ssid), RGB565_WHITE, 2);
+    drawRow(212, "IP: " + WiFi.localIP().toString(), RGB565_GREEN, 2);
+    String bleName = "BADGE-" + WiFi.macAddress().substring(12); bleName.replace(":", "");
+    drawRow(252, bleEnabled ? "BLE: " + bleName : "BLE provisioning off", RGB565_YELLOW, 2);
+    drawRow(282, bleEnabled ? "Open provision.html" : "Enable in Settings", RGB565_WHITE, 2);
+    drawRow(320, "Voice: " + voiceLabel(), RGB565_WHITE, 2);
+    drawRow(350, voiceError().isEmpty() ? ascii(message) : voiceError(), RGB565_WHITE, 1);
   }
-  drawRow(252, batteryHint ? String(batteryHint) : String(touchInfo),
-          batteryPolicy.conserve() ? RGB565_RED : RGB565_YELLOW, 2);
-  // Echo message, wrapped row by row inside the circle.
-  {
-    String rest = message;
-    for (int y = 280; y <= 330; y += 22) {
-      int maxChars = maxCharsForRow(y, 2);
-      if (maxChars <= 0)
-        break;
-      String line = rest.substring(0, min((size_t)maxChars, rest.length()));
-      rest = rest.substring(line.length());
-      drawRow(y, line, RGB565_WHITE, 2);
+  for (const auto &b : BadgeUI::buttons) {
+    if (b.page != page) continue;
+    String label;
+    switch (b.id) {
+      case Control::Talk: label = voiceRecording() ? "Send question" : voiceBusy() ? "Cancel" : "Start talking"; break;
+      case Control::Settings: label = "Settings"; break;
+      case Control::VolumeDown: case Control::BrightnessDown: label = "-"; break;
+      case Control::VolumeUp: case Control::BrightnessUp: label = "+"; break;
+      case Control::Wifi: label = bleEnabled ? "Wi-Fi ON" : "Wi-Fi setup"; break;
+      case Control::Info: label = "Info"; break;
+      case Control::Back: label = "Back"; break;
+      default: break;
     }
+    drawButton(b, label);
   }
-  char volumeLabel[32];
-  snprintf(volumeLabel, sizeof(volumeLabel), "[-] Volume: %3d [+]", voiceVolume());
-  drawRow(352, volumeLabel, voiceVolume() == 0 ? RGB565_YELLOW : RGB565_CYAN, 2);
-  String action = voiceBusy() ? (voiceRecording() ? "Tap: finish recording" : "Tap: cancel") :
-                  voiceConfigured() ? "Tap: ask a question" : "Voice not configured";
-  drawRow(388, action, voiceBusy() ? RGB565_YELLOW : RGB565_CYAN, 2);
   statusNeedsClear = false;
   lastScreen = millis();
 }
@@ -322,11 +391,10 @@ void drawScreensaver(bool first) {
 
 void displayTick() {
   bool speaking = voiceBusy();
-  if (speaking || voiceWasBusy) {
-    if (!batteryPolicy.shutdownDue) userActivity();
-    if (speaking) message = "Voice: " + voiceLabel();
-    else message = "Voice: " + voiceLabel() + "\n" + (voiceError().isEmpty() ? String("Ready for next question") : voiceError());
-    screenDirty = true;
+  if (speaking || voiceWasBusy) screensaver.keepAwake(millis());
+  if (!notice.isEmpty() && int32_t(millis() - noticeUntil) >= 0) { notice = ""; screenDirty = true; }
+  if (feedbackButton != Control::None && int32_t(millis() - feedbackUntil) >= 0) {
+    feedbackButton = Control::None; screenDirty = true;
   }
   voiceWasBusy = speaking;
   bool changed = screensaver.tick(millis(), batteryPolicy.conserve());
@@ -343,7 +411,7 @@ void displayTick() {
   } else if (screensaver.active) {
     if (millis() - lastSaverFrame >= 67)
       drawScreensaver(false);
-  } else if (screenDirty || millis() - lastScreen >= 1000) {
+  } else if (screenDirty || millis() - lastScreen >= 250) {
     drawScreen();
     screenDirty = false;
   }
@@ -706,22 +774,84 @@ String ascii(const String &s) {
   return output;
 }
 
+bool controlEnabled(Control id) {
+  switch (id) {
+    case Control::VolumeDown: return voiceVolume() > 0;
+    case Control::VolumeUp: return voiceVolume() < 100;
+    case Control::BrightnessDown: return brightness > 64;
+    case Control::BrightnessUp: return brightness < 255;
+    case Control::Wifi: return !voiceBusy();
+    default: return !batteryPolicy.shutdownDue;
+  }
+}
+
+void performVoiceAction(BadgeUI::VoiceAction action) {
+  if (batteryPolicy.shutdownDue) return;
+  userActivity(); showPage(Page::Home);
+  // A touch released after the voice state changed must not start another job.
+  if (action == BadgeUI::VoiceAction::Start) {
+    if (!voiceBusy()) voiceStart();
+  } else if (action == BadgeUI::VoiceAction::Send) {
+    voiceStopRecording();
+  } else {
+    if (voiceBusy()) { voiceCancel(); showNotice("Cancelling..."); }
+  }
+  feedbackButton = Control::Talk; feedbackUntil = millis() + 160;
+}
+
+void activateControl(Control id) {
+  if (!controlEnabled(id)) return;
+  userActivity();
+  switch (id) {
+    case Control::Talk: performVoiceAction(touchVoiceAction); return;
+    case Control::Settings: notice = ""; showPage(Page::Settings); return;
+    case Control::Back: notice = ""; showPage(page == Page::Info ? Page::Settings : Page::Home); return;
+    case Control::Info: showPage(Page::Info); return;
+    case Control::VolumeDown: case Control::VolumeUp: {
+      int volume = constrain(voiceVolume() + (id == Control::VolumeUp ? 10 : -10), 0, 100);
+      showNotice(voiceSetVolume(volume) ? "Volume saved" : voiceVolumeError()); break;
+    }
+    case Control::BrightnessDown: case Control::BrightnessUp: {
+      uint8_t level = id == Control::BrightnessUp ? (brightness < 160 ? 160 : 255) : (brightness > 160 ? 160 : 64);
+      showNotice(setBrightness(level) ? "Brightness saved" : displayError); break;
+    }
+    case Control::Wifi: enableProvisioning(); showPage(Page::Info); return;
+    default: return;
+  }
+  feedbackButton = id; feedbackUntil = millis() + 160; screenDirty = true;
+}
+
 void bootButtonTick() {
-  // BOOT = GPIO0, externally pulled up, low while pressed. Hold 3s to start
-  // BLE provisioning.
-  static uint32_t pressedAt = 0;
-  static bool fired = false;
-  bool pressed = digitalRead(0) == LOW;
-  if (pressed)
-    userActivity();
-  if (pressed && !pressedAt) {
-    pressedAt = millis();
-    fired = false;
-  } else if (pressed && !fired && millis() - pressedAt >= 3000) {
-    fired = true;
-    enableProvisioning();
-  } else if (!pressed) {
-    pressedAt = 0;
+  if (bootButton.update(digitalRead(0) == LOW, millis()))
+    performVoiceAction(BadgeUI::voiceAction(voiceBusy(), voiceRecording()));
+}
+
+void touchTick() {
+  bool pressed = boardTouchPressed();
+  bool newPress = pressed && !touch.down;
+  bool sleeping = screensaver.active || screensaver.screenOff;
+  int16_t x = -1, y = -1; uint32_t age;
+  boardTouchPoint(x, y, age);
+  auto previous = touch.captured;
+  if (newPress) {
+    touchVoiceAction = BadgeUI::voiceAction(voiceBusy(), voiceRecording());
+    if (!batteryPolicy.shutdownDue) userActivity();
+  }
+  auto action = touch.update(pressed, x, y, page, !sleeping && !batteryPolicy.shutdownDue);
+  if (touch.captured != Control::None && !controlEnabled(touch.captured)) touch.cancel();
+  if (previous != touch.captured) screenDirty = true;
+  if (pressed && !screensaver.screenOff) screensaver.keepAwake(millis());
+  if (action != Control::None) activateControl(action);
+}
+
+void pwrButtonTick() {
+  uint32_t count = boardPwrShortPressCount();
+  while (lastPwrPressHandled != count) {
+    ++lastPwrPressHandled;
+    touch.cancel(); feedbackButton = Control::None;
+    if (screensaver.active || screensaver.screenOff) userActivity();
+    else { screensaver.sleep(); sleepPanel(); }
+    screenDirty = true;
   }
 }
 
@@ -753,6 +883,7 @@ void appSetup() {
   gfx->setBrightness(brightness);
 
   statusRowReady = statusRow.begin();
+  buttonCanvasReady = buttonCanvas.begin();
   timeSyncSetup();
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
@@ -785,8 +916,7 @@ void appSetup() {
   microphoneSetup();
   voiceSetup();
   lastPwrPressHandled = boardPwrShortPressCount();
-  lastTouchHandled = boardTouchSequence();
-  lastTapHandled = boardTouchTapSequence();
+  bootButton.update(digitalRead(0) == LOW, millis());
   httpSetup();
   Serial.printf("BADGE %s ready\n", FIRMWARE_VERSION);
   userActivity();
@@ -794,7 +924,7 @@ void appSetup() {
 }
 
 void appLoop() {
-  // USB console offers the same provisioning action as the physical BOOT key.
+  // USB console retains provisioning and voice debugging commands.
   static String console;
   while (Serial.available()) {
     char c = Serial.read();
@@ -839,46 +969,8 @@ void appLoop() {
   http.handleClient();
   boardIOTick();
   batteryTick();
-  uint32_t touchSequence = boardTouchSequence();
-  uint32_t tapSequence = boardTouchTapSequence();
-  bool wasSleeping = screensaver.active || screensaver.screenOff;
-  if (touchSequence != lastTouchHandled) {
-    lastTouchHandled = touchSequence;
-    userActivity();
-    screenDirty = true;
-  }
-  if (tapSequence != lastTapHandled) {
-    lastTapHandled = tapSequence;
-    int16_t x, y; uint32_t age;
-    if (!wasSleeping && !batteryPolicy.shutdownDue && boardTouchPoint(x, y, age) &&
-        uint32_t(millis() - lastVoiceTap) >= 350) {
-      bool minus = x >= 100 && x <= 175 && y >= 338 && y <= 375;
-      bool plus = x >= 291 && x <= 366 && y >= 338 && y <= 375;
-      bool action = x >= 120 && x <= 346 && y >= 376 && y <= 427;
-      if (minus || plus || action) {
-        lastVoiceTap = millis();
-        if (minus || plus) {
-          int value = constrain(voiceVolume() + (plus ? 10 : -10), 0, 100);
-          if (!voiceSetVolume(value)) message = "Volume error\n" + voiceVolumeError();
-        } else if (voiceBusy()) { if (!voiceStopRecording()) voiceCancel(); }
-        else if (!voiceStart()) message = "Voice unavailable\n" + voiceError();
-        userActivity(); screenDirty = true;
-      }
-    }
-  }
-  // PWR short press cycles screen brightness.
-  constexpr uint8_t levels[] = {64, 160, 255};
-  uint32_t pwrCount = boardPwrShortPressCount();
-  while (lastPwrPressHandled != pwrCount) {
-    ++lastPwrPressHandled;
-    userActivity();
-    size_t index = 0;
-    for (size_t i = 0; i < sizeof(levels); ++i)
-      if (levels[i] == brightness)
-        index = i;
-    setBrightness(levels[(index + 1) % sizeof(levels)]);
-    Serial.printf("PWR short press, brightness -> %u\n", brightness);
-  }
+  touchTick();
+  pwrButtonTick();
   displayTick();
   delay(2);
 }

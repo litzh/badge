@@ -10,6 +10,7 @@ void voiceCancel();
 bool voiceReset();
 bool voiceBusy();
 bool voiceRecording();
+uint32_t voiceRecordedMs();
 bool voiceConfigured();
 int voiceVolume();
 // Main loop only: persist first, then notify the audio worker.

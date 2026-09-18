@@ -455,6 +455,9 @@ void voiceSetup() {
 bool voiceConfigured() { return VOICE_MINIMAX_KEY[0] && VOICE_DEEPSEEK_KEY[0] && VOICE_SYSTEM_PROMPT[0]; }
 bool voiceBusy() { return busy.load(); }
 bool voiceRecording() { return recordingNow.load(); }
+uint32_t voiceRecordedMs() {
+  portENTER_CRITICAL(&stateLock); uint32_t ms = current.recordedMs; portEXIT_CRITICAL(&stateLock); return ms;
+}
 int voiceVolume() { return playbackVolume.load(); }
 String voiceVolumeError() { return volumeError; }
 bool voiceSetVolume(int volume) {

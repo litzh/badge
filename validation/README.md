@@ -2,7 +2,19 @@
 
 以下命令在 badge 根目录运行。Python 统一通过 uv 执行。
 
+## 0.7.0 交互验证记录（2026-09-18）
+
+- BOOT 消抖/长按/上电按住/时间回绕、触摸唤醒/松开/滑出取消/切页取消、圆屏按钮边界及手动熄屏状态测试通过。
+- 原屏保计时与语音 WAV 协议测试通过；离线检查主页、录音高亮、设置和信息页布局（非实机截图）。
+- 固件编译、USB 写入及哈希校验通过；应用 1,577,063 字节（50%）、静态 RAM 65,464 字节（19%）。
+- 实机 `/status` 确认 `badge-0.7.0`，保留用户音量 100、亮度 255；显式唤醒返回主页，10 秒后恢复屏保及采音。
+- 本轮没有主动录音、播放或调用云服务。实体 BOOT/PWR、触摸按下反馈及播放中熄屏仍需用户手动体验。
+
 ## 无需设备
+
+`clang++ -std=c++17 -Wall -Wextra -Werror validation/interaction.cpp -o /tmp/badge-interaction-test && /tmp/badge-interaction-test`：
+BOOT 消抖/长按/上电按住/计时回绕，触摸唤醒/松开/滑出取消，圆屏按钮边界，问答期间手动熄屏保持。
+`uv run validation/render_ui.py`：使用固件按钮坐标与实际 ASCII 字体生成离线布局预览；不是实体屏幕截图。
 
 语音配置与协议测试：`uv run validation/test_voice_config.py`；
 `clang++ -std=c++17 -Wall -Wextra -Werror validation/voice_protocol.cpp -o /tmp/badge-voice-protocol && /tmp/badge-voice-protocol`。

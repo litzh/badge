@@ -402,6 +402,7 @@ bool boardTouchPoint(int16_t &x, int16_t &y, uint32_t &ageMs) {
 uint32_t boardPwrShortPressCount() { return pwrShortPressCount; }
 uint32_t boardTouchSequence() { return touchSequence; }
 uint32_t boardTouchTapSequence() { return touchTapSequence; }
+bool boardTouchPressed() { return touchPressed; }
 
 BatterySample boardBatterySample() {
   BatterySample sample;
