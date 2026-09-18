@@ -6,6 +6,8 @@
 [80 粒子动画](visualizer.md)；v0.3.0 的 7 个移动光点仍作为内存不足时的降级画面。
 没有常亮文字或边框，亮度临时限制为
 `min(正常亮度, 128)`（v0.4.2），唤醒恢复原值；不反复写 NVS。
+v0.5.0 限制屏保最多显示 5 分钟，随后面板休眠并停止采音/动画，查询接口仍在线。
+低电保护与电量显示见 [电池管理](power-management.md)。
 
 触摸、BOOT 按下、PWR 短按、成功的 `/echo` 或亮度写入、BLE 配网提交以及串口
 `provision` 都会重置计时并唤醒。PWR 短按继续循环亮度，BOOT 长按继续配网。
@@ -48,6 +50,8 @@ uv run scripts/battery_monitor.py http://DEVICE_IP --duration 7200 --label '充�
 
 - `samples.csv`：UTC 时间、经过秒数、电压、PMU 电量估计、USB/充放电状态、
   屏保、正常/实际亮度、设备 uptime、RSSI、请求耗时、故障与重启标记。
+  v0.5.0 增加 `screen_off`、`display_mode`、`battery_low`、`shutdown_pending`、`shutdown_status`，
+  用于区分熄屏与屏保、检查保护前状态；旧 CSV 仍可重绘，缺失字段显示未知。
 - `raw.jsonl`：每次采样及设备原始状态 JSON，保留无法解码或未知字段的排查线索；
   请求失败保留错误说明，原始状态为 null。
 - `battery.html`：完全本地、无 CDN 依赖的曲线，运行中每 10 秒自动刷新，鼠标悬停查看数据。
@@ -80,12 +84,22 @@ uv run scripts/battery_monitor.py --plot recordings/standby-01/samples.csv --ope
    **不能自动认定为电池耗尽**，也可能是路由器、网络或设备重启。
 
 测得的是“Wi-Fi 在线 + 动态屏保 + 持续轮询”的续航，不是无联网/关屏/深睡续航。
+这是 v0.4.2 的测试条件；v0.5.0 会在 5 分钟屏保后熄屏，报告时应根据 `display_mode`
+区分实际测试阶段，不能与旧版持续动态屏保直接等同。
 v0.4.0 新增持续麦克风采样和全屏粒子渲染，v0.4.2 将屏保亮度上限由 24 提高至 128，
 功耗条件与 v0.3.0 不同；比较续航时
 请保持固件版本、亮度和声音环境一致，不能把原有测试结果直接视作新版续航。
 电压不能直接换算剩余电量；PMU 百分比为未独立校准的估算。
 本程序没有实测电流数据，不输出伪精确的 mA、mAh 或充电功率。
 真实充满和续航时长需要一次完整实验才能得出。
+
+首轮 [完整周期分析](battery-analysis-20260918/analysis.md) 已保留。
+可用以下命令重新生成分析文件（只读原始记录，绘图依赖由 uv 管理）：
+
+```sh
+uv run scripts/analyze_battery.py recordings/20260917-180915-893121/samples.csv \
+  --output docs/battery-analysis-20260918
+```
 
 ## 开发验证
 

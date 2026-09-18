@@ -30,6 +30,25 @@ def sample(data, **kwargs):
 
 
 class BatteryMonitorTest(unittest.TestCase):
+    def test_old_csv_and_new_screen_off_fields(self):
+        data = status()
+        data["display"].update(screensaver=False, screen_off=True, mode="off", effective_brightness=0)
+        data["battery"].update(low=True, shutdown_pending=False, shutdown_status="idle")
+        row = sample(data)
+        self.assertTrue(row["screen_off"])
+        self.assertEqual(row["display_mode"], "off")
+        self.assertEqual(row["effective_brightness"], 0)
+        self.assertTrue(row["battery_low"])
+        with tempfile.TemporaryDirectory() as temp:
+            legacy = Path(temp) / "old.csv"
+            with legacy.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=monitor.LEGACY_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerow(row)
+            loaded = monitor.load_csv(legacy)[0]
+            self.assertIsNone(loaded["screen_off"])
+            self.assertEqual(loaded["voltage_v"], row["voltage_v"])
+
     def test_unknown_and_failed_measurements_are_not_zero(self):
         legacy = status()
         legacy["battery"].pop("percent")

@@ -11,5 +11,8 @@ struct MicrophoneSnapshot {
 };
 void microphoneSetup();
 void microphoneSetEnabled(bool enabled);
+// Exclusive ownership for voice capture/playback. Only the acquiring task releases.
+bool microphoneAcquire();
+void microphoneRelease();
 MicrophoneSnapshot microphoneSnapshot();
 cJSON *microphoneStatus();

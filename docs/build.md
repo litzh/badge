@@ -22,10 +22,20 @@ esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,FlashMode=qio,PartitionScheme=app3M_
 
 产物在 `build/`。
 
-构建脚本自动通过 uv 加载项目根目录 `.env`，读取 `BADGE_WIFI_SSID` /
+构建脚本自动通过 uv 加载上一级 `.env` 和项目根目录 `.env`（项目内同名值优先，进程环境优先于文件），读取 `BADGE_WIFI_SSID` /
 `BADGE_WIFI_PASSWORD`；如果两者均未提供，则兼容旧的 `RLCD_WIFI_SSID` /
 `RLCD_WIFI_PASSWORD`。两套变量不会交叉拼接。生成的 `wifi_defaults.h` 和 `.env`
 均被 Git 忽略；构建产物包含默认网络凭据，不应公开分发。NVS 保存的网络仍优先。
+
+语音密钥 `MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` 同样由构建环境读取，音色默认
+`male-qn-qingse`，系统提示词默认读取 `prompts/voice.txt`。例如：
+
+```sh
+BADGE_VOICE_ID=male-qn-qingse BADGE_SYSTEM_PROMPT_FILE=prompts/voice.txt bash scripts/build.sh
+```
+
+生成的 `voice_defaults.h` 被 Git 忽略，固件包含服务密钥。更多构建变量与约束见
+[语音问答](voice.md#构建参数)。修改提示词或音色后需要重新构建、烧录。
 
 macOS Apple Silicon 若 Arduino 自带的 Intel ctags 报 `Bad CPU type in executable`，
 可在安装 Xcode Command Line Tools 后运行：

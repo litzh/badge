@@ -33,6 +33,7 @@ const last=samples.at(-1), valid=samples.filter(s=>Number.isFinite(s.voltage_v))
 const text=(id,value)=>document.getElementById(id).textContent=value;
 const duration=s=>s<3600?`${(s/60).toFixed(1)} 分钟`:`${(s/3600).toFixed(2)} 小时`;
 const yes=v=>v===true?'是':v===false?'否':'未知';
+const mode=s=>({off:'已熄屏',screensaver:'动态屏保',status:'状态页'}[s.display_mode]||(s.screensaver===true?'动态屏保':'未知'));
 text('meta',`${metadata.device} · ${running?'记录中 · 页面每 10 秒刷新':'记录已停止'} · 采样间隔 ${metadata.interval} 秒`);
 if(last){
  text('voltage',Number.isFinite(last.voltage_v)?`${last.voltage_v.toFixed(3)} V`:'不可用');
@@ -40,7 +41,7 @@ if(last){
  text('duration',duration(last.elapsed_seconds));
  text('count',`${valid.length} / ${samples.length}`);
  const first=valid[0],latest=valid.at(-1),failures=samples.filter(s=>!s.reachable).length;
- text('status',`最新采样：${new Date(last.timestamp_utc).toLocaleString()}；设备在线：${yes(last.reachable)}；USB 供电：${yes(last.vbus_present)}；${names[last.power_state]||'电池状态未知'}；屏保：${yes(last.screensaver)}；实际亮度：${last.effective_brightness??'未知'}。连接失败 ${failures} 次，检测到设备运行时间回退 ${samples.filter(s=>s.reboot_detected).length} 次。${first?` 首个有效电压 ${first.voltage_v.toFixed(3)} V，末个有效电压 ${latest.voltage_v.toFixed(3)} V。`:''}${last.error?` 最新错误：${last.error}`:''}`);
+ text('status',`最新采样：${new Date(last.timestamp_utc).toLocaleString()}；设备在线：${yes(last.reachable)}；USB 供电：${yes(last.vbus_present)}；${names[last.power_state]||'电池状态未知'}；屏幕：${mode(last)}；低电：${yes(last.battery_low)}；实际亮度：${last.effective_brightness??'未知'}。连接失败 ${failures} 次，检测到设备运行时间回退 ${samples.filter(s=>s.reboot_detected).length} 次。${first?` 首个有效电压 ${first.voltage_v.toFixed(3)} V，末个有效电压 ${latest.voltage_v.toFixed(3)} V。`:''}${last.error?` 最新错误：${last.error}`:''}`);
 }else{text('status','等待第一次采样。')}
 const xmax=Math.max(60,last?.elapsed_seconds||0);
 const unit=xmax>=3600?3600:60, unitName=unit===3600?'小时':'分钟';

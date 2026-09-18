@@ -88,7 +88,8 @@
 - 每块选择 RMS 较强的通道分析，避免双麦反相相加抵消。去直流后提取三个宽频段，
   具体算法见 `firmware/badge/audio_features.h`。
 - `firmware/badge/src/esp_codec_dev` 移植自 RLCD 所用的随附库，保留 Apache-2.0 许可证。
-  ES8311 播放未启用，PA GPIO46 保持低电平。
+  v0.6.0 增加 ES8311 播放，I2S 收发统一为 16 kHz，录音与播放分时使用；
+  仅播放期间启用 PA GPIO46，结束/取消后关闭。屏保与语音由同一音频互斥锁协调。
 
 ### AXP2101 电源
 

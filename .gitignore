@@ -1,5 +1,6 @@
 build/
 firmware/badge/wifi_defaults.h
+firmware/badge/voice_defaults.h
 .env
 recordings/
 __pycache__/

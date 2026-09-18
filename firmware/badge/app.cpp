@@ -9,6 +9,8 @@
 #include "microphone.h"
 #include "visualizer.h"
 #include "display_frame.h"
+#include "time_sync.h"
+#include "voice.h"
 #include "Arduino_GFX_Library.h"
 #include "pin_config.h"
 #include <WiFi.h>
@@ -25,7 +27,7 @@
 
 namespace {
 
-constexpr char FIRMWARE_VERSION[] = "badge-0.4.2";
+constexpr char FIRMWARE_VERSION[] = "badge-0.6.1";
 
 // Round-screen geometry: 466x466 panel, visible area is the inscribed circle.
 constexpr int16_t SCREEN = 466;
@@ -45,18 +47,45 @@ bool storageOK = false, displayStorageOK = false;
 uint8_t brightness = 160;
 String displayError;
 ScreensaverState screensaver;
+BatteryPolicy batteryPolicy;
+bool panelSleeping = false;
+const char *powerOffStatus = "idle";
+uint32_t lastPowerOffAttempt = 0;
+bool powerOffAttempted = false;
 bool screenDirty = true;
 bool statusNeedsClear = true;
 Arduino_Canvas statusRow(SCREEN, 24, nullptr);
 bool statusRowReady = false;
 uint32_t lastSaverFrame = 0;
 uint32_t lastTouchHandled = 0;
+uint32_t lastTapHandled = 0, lastVoiceTap = 0;
+bool voiceWasBusy = false;
+
+uint8_t effectiveBrightness() {
+  uint8_t value = screensaver.effectiveBrightness(brightness);
+  return batteryPolicy.conserve() && value > 64 ? 64 : value;
+}
+
+void sleepPanel() {
+  microphoneSetEnabled(false);
+  boardSetVisualActive(false);
+  if (!panelSleeping) {
+    gfx->setBrightness(0);
+    gfx->displayOff();
+    panelSleeping = true;
+  }
+}
 
 void userActivity() {
-  bool wasActive = screensaver.active;
+  if (batteryPolicy.shutdownDue) return;
+  bool wasActive = screensaver.active || screensaver.screenOff;
   screensaver.activity(millis());
+  if (panelSleeping) {
+    gfx->displayOn();
+    panelSleeping = false;
+  }
   if (wasActive)
-    gfx->setBrightness(brightness);
+    gfx->setBrightness(effectiveBrightness());
   if (wasActive) {
     statusNeedsClear = true;
     microphoneSetEnabled(false);
@@ -67,11 +96,50 @@ void userActivity() {
 
 void addDisplayState(cJSON *j) {
   cJSON_AddNumberToObject(j, "brightness", brightness);
-  cJSON_AddNumberToObject(j, "effective_brightness", screensaver.effectiveBrightness(brightness));
+  cJSON_AddNumberToObject(j, "effective_brightness", effectiveBrightness());
   cJSON_AddNumberToObject(j, "screensaver_brightness_limit", ScreensaverState::BRIGHTNESS_LIMIT);
   cJSON_AddBoolToObject(j, "screensaver", screensaver.active);
+  cJSON_AddBoolToObject(j, "screen_off", screensaver.screenOff);
+  cJSON_AddStringToObject(j, "mode", screensaver.screenOff ? "off" : screensaver.active ? "screensaver" : "status");
+  cJSON_AddNumberToObject(j, "screensaver_max_display_ms", ScreensaverState::MAX_DISPLAY_MS);
   cJSON_AddNumberToObject(j, "idle_ms", uint32_t(millis() - screensaver.lastActivity));
   cJSON_AddNumberToObject(j, "screensaver_timeout_ms", ScreensaverState::TIMEOUT_MS);
+}
+
+void addBatteryManagement(cJSON *b) {
+  cJSON_AddBoolToObject(b, "low", batteryPolicy.low);
+  cJSON_AddBoolToObject(b, "shutdown_pending", batteryPolicy.cutoffPending);
+  cJSON_AddStringToObject(b, "shutdown_status", powerOffStatus);
+  cJSON_AddNumberToObject(b, "low_voltage_v", BatteryPolicy::LOW_MV / 1000.0);
+  cJSON_AddNumberToObject(b, "shutdown_voltage_v", BatteryPolicy::CUTOFF_MV / 1000.0);
+  cJSON_AddNumberToObject(b, "shutdown_confirm_ms", BatteryPolicy::CONFIRM_MS);
+  cJSON_AddStringToObject(b, "percent_source", "pmu_estimate");
+}
+
+void batteryTick() {
+  bool wasConserving = batteryPolicy.conserve();
+  batteryPolicy.update(boardBatterySample(), millis());
+  if (wasConserving != batteryPolicy.conserve()) {
+    screenDirty = true;
+    if (!panelSleeping) gfx->setBrightness(effectiveBrightness());
+  }
+  if (!batteryPolicy.shutdownDue) {
+    powerOffAttempted = false;
+    powerOffStatus = "idle";
+    return;
+  }
+  screensaver.active = false;
+  screensaver.screenOff = true;
+  voiceCancel();
+  sleepPanel();
+  if (!powerOffAttempted || uint32_t(millis() - lastPowerOffAttempt) >= 5000) {
+    powerOffAttempted = true;
+    lastPowerOffAttempt = millis();
+    PowerOffResult result = boardPowerOffIfLow(BatteryPolicy::CUTOFF_MV);
+    powerOffStatus = result == PowerOffResult::Requested ? "requested" :
+                     result == PowerOffResult::WriteFailed ? "write_failed" : "cancelled";
+    Serial.printf("BATTERY protective shutdown: %s\n", powerOffStatus);
+  }
 }
 
 bool bleEnabled = false, bleReady = false;
@@ -137,7 +205,7 @@ void drawRow(int16_t y, const String &text, uint16_t color, uint8_t size) {
     return;
   String clipped = (int)text.length() > maxChars ? text.substring(0, maxChars) : text;
   struct CachedRow { int16_t y = -1; String text; uint16_t color = 0; uint8_t size = 0; };
-  static CachedRow rows[12];
+  static CachedRow rows[14];
   CachedRow *cached = nullptr;
   for (auto &row : rows) {
     if (row.y == y || row.y == -1) { cached = &row; break; }
@@ -164,7 +232,9 @@ void drawRow(int16_t y, const String &text, uint16_t color, uint8_t size) {
 
 void drawScreen() {
   if (statusNeedsClear) gfx->fillScreen(RGB565_BLACK);
+  drawRow(68, timeSyncDisplay(), RGB565_WHITE, 2);
   drawRow(96, "BADGE", RGB565_CYAN, 3);
+  drawRow(126, bleEnabled ? "BLE setup: open provision.html" : "Hold BOOT 3s for Wi-Fi setup", RGB565_MAGENTA, 1);
   drawRow(140, "State: " + phase, RGB565_WHITE, 2);
   drawRow(168, "SSID: " + (ssid.length() ? ssid : String("--")), RGB565_WHITE, 2);
   String ip = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("--");
@@ -173,18 +243,29 @@ void drawScreen() {
   uint16_t mv;
   bool batOK;
   boardBattery(mv, batOK);
-  if (batOK)
-    snprintf(bat, sizeof(bat), "Battery: %.2f V", mv / 1000.0f);
+  BatterySample sample = boardBatterySample();
+  if (batOK && sample.percent >= 0)
+    snprintf(bat, sizeof(bat), "Battery: %d%%  %.2f V", sample.percent, mv / 1000.0f);
+  else if (batOK)
+    snprintf(bat, sizeof(bat), "Battery: --%%  %.2f V", mv / 1000.0f);
   else
     snprintf(bat, sizeof(bat), "Battery: --");
-  drawRow(224, bat, RGB565_YELLOW, 2);
+  drawRow(224, bat, batteryPolicy.conserve() ? RGB565_RED : RGB565_YELLOW, 2);
   int16_t tx;
   int16_t ty;
   uint32_t touchAge;
   char touchInfo[48] = "Touch: --";
   if (boardTouchPoint(tx, ty, touchAge) && touchAge < 60000)
     snprintf(touchInfo, sizeof(touchInfo), "Touch: %d, %d", tx, ty);
-  drawRow(252, touchInfo, RGB565_YELLOW, 2);
+  const char *batteryHint = nullptr;
+  if (batteryPolicy.cutoffPending) batteryHint = "LOW VOLTAGE - CONNECT USB";
+  else if (batteryPolicy.low) batteryHint = "LOW BATTERY - CONNECT USB";
+  else if (sample.powerValid && sample.vbus) {
+    batteryHint = sample.direction == 1 ? "Charging" :
+                  sample.percent == 100 && sample.chargerStatus == 4 ? "Fully charged - USB" : "USB power";
+  }
+  drawRow(252, batteryHint ? String(batteryHint) : String(touchInfo),
+          batteryPolicy.conserve() ? RGB565_RED : RGB565_YELLOW, 2);
   // Echo message, wrapped row by row inside the circle.
   {
     String rest = message;
@@ -197,9 +278,12 @@ void drawScreen() {
       drawRow(y, line, RGB565_WHITE, 2);
     }
   }
-  drawRow(352, bleEnabled ? "BLE provisioning: open provision.html"
-                          : "Hold BOOT 3s for Wi-Fi setup",
-          RGB565_MAGENTA, 2);
+  char volumeLabel[32];
+  snprintf(volumeLabel, sizeof(volumeLabel), "[-] Volume: %3d [+]", voiceVolume());
+  drawRow(352, volumeLabel, voiceVolume() == 0 ? RGB565_YELLOW : RGB565_CYAN, 2);
+  String action = voiceBusy() ? (voiceRecording() ? "Tap: finish recording" : "Tap: cancel") :
+                  voiceConfigured() ? "Tap: ask a question" : "Voice not configured";
+  drawRow(388, action, voiceBusy() ? RGB565_YELLOW : RGB565_CYAN, 2);
   statusNeedsClear = false;
   lastScreen = millis();
 }
@@ -237,10 +321,23 @@ void drawScreensaver(bool first) {
 }
 
 void displayTick() {
-  if (screensaver.tick(millis())) {
+  bool speaking = voiceBusy();
+  if (speaking || voiceWasBusy) {
+    if (!batteryPolicy.shutdownDue) userActivity();
+    if (speaking) message = "Voice: " + voiceLabel();
+    else message = "Voice: " + voiceLabel() + "\n" + (voiceError().isEmpty() ? String("Ready for next question") : voiceError());
+    screenDirty = true;
+  }
+  voiceWasBusy = speaking;
+  bool changed = screensaver.tick(millis(), batteryPolicy.conserve());
+  if (screensaver.screenOff) {
+    sleepPanel();
+    return;
+  }
+  if (changed) {
     microphoneSetEnabled(true);
     boardSetVisualActive(true);
-    gfx->setBrightness(screensaver.effectiveBrightness(brightness));
+    gfx->setBrightness(effectiveBrightness());
     drawScreensaver(true);
     screenDirty = false;
   } else if (screensaver.active) {
@@ -429,6 +526,7 @@ void networkTick() {
 String statusJson() {
   cJSON *j = cJSON_CreateObject();
   cJSON_AddStringToObject(j, "firmware", FIRMWARE_VERSION);
+  cJSON_AddItemToObject(j, "time_sync", timeSyncStatus());
   cJSON_AddNumberToObject(j, "uptime_seconds", millis() / 1000);
   cJSON_AddNumberToObject(j, "free_heap_bytes", ESP.getFreeHeap());
   cJSON_AddNumberToObject(j, "free_psram_bytes", ESP.getFreePsram());
@@ -445,12 +543,15 @@ String statusJson() {
     cJSON_AddNullToObject(w, "rssi_dbm");
   cJSON_AddBoolToObject(w, "provisioning", bleEnabled);
   cJSON_AddStringToObject(w, "provisioning_result", provisionResult.c_str());
-  cJSON_AddItemToObject(j, "battery", boardBatteryStatus());
+  auto *battery = boardBatteryStatus();
+  addBatteryManagement(battery);
+  cJSON_AddItemToObject(j, "battery", battery);
   cJSON_AddItemToObject(j, "touch", boardTouchStatus());
   cJSON_AddItemToObject(j, "imu", boardImuStatus());
   cJSON_AddItemToObject(j, "buttons", boardButtonsStatus());
   addDisplayState(cJSON_AddObjectToObject(j, "display"));
   cJSON_AddItemToObject(j, "microphone", microphoneStatus());
+  cJSON_AddItemToObject(j, "voice", voiceStatus());
   cJSON_AddItemToObject(j, "visualizer", visualizerStatus());
   return jsonText(j);
 }
@@ -474,7 +575,7 @@ bool setBrightness(uint8_t value) {
   }
   brightness = value;
   userActivity();
-  gfx->setBrightness(brightness);
+  if (!panelSleeping) gfx->setBrightness(effectiveBrightness());
   displayError = "";
   return true;
 }
@@ -483,6 +584,72 @@ void httpSetup() {
   http.on("/status", HTTP_GET, [] { http.send(200, "application/json", statusJson()); });
   http.on("/display", HTTP_GET, [] { http.send(200, "application/json", displayJson()); });
   http.on("/visualizer", HTTP_GET, [] { http.send(200, "application/json", jsonText(visualizerStatus())); });
+  http.on("/voice", HTTP_GET, [] { http.send(200, "application/json", jsonText(voiceStatus())); });
+  http.on("/voice/volume", HTTP_POST, [] {
+    String body = http.arg("plain");
+    if (body.length() > 128) { http.send(413, "application/json", "{\"error\":\"body_too_large\"}"); return; }
+    auto *j = parseObject(body);
+    auto *v = cJSON_GetObjectItemCaseSensitive(j, "volume");
+    bool valid = cJSON_IsNumber(v) && v->valuedouble >= 0 && v->valuedouble <= 100 && v->valuedouble == v->valueint;
+    int value = valid ? v->valueint : -1;
+    cJSON_Delete(j);
+    if (!valid) { http.send(400, "application/json", "{\"error\":\"invalid_volume\"}"); return; }
+    bool ok = voiceSetVolume(value);
+    if (ok) { userActivity(); screenDirty = true; }
+    http.send(ok ? 200 : 500, "application/json", jsonText(voiceStatus()));
+  });
+  http.on("/voice/start", HTTP_POST, [] {
+    String body = http.arg("plain");
+    if (body.length() > 128) { http.send(413, "application/json", "{\"error\":\"body_too_large\"}"); return; }
+    auto *j = body.isEmpty() ? cJSON_CreateObject() : parseObject(body);
+    auto *m = cJSON_GetObjectItemCaseSensitive(j, "mode");
+    String mode = cJSON_IsString(m) ? m->valuestring : "chat";
+    bool valid = j && (!m || cJSON_IsString(m)) && (mode == "chat" || mode == "echo" || mode == "loopback");
+    cJSON_Delete(j);
+    if (!valid) { http.send(400, "application/json", "{\"error\":\"invalid_mode\"}"); return; }
+    bool ok = !batteryPolicy.shutdownDue && voiceStart(mode == "echo" ? VoiceMode::Echo : mode == "loopback" ? VoiceMode::Loopback : VoiceMode::Chat);
+    if (ok) { userActivity(); screenDirty = true; }
+    http.send(ok ? 202 : 409, "application/json", jsonText(voiceStatus()));
+  });
+  http.on("/voice/stop", HTTP_POST, [] {
+    bool ok = voiceStopRecording();
+    if (ok) userActivity();
+    http.send(ok ? 202 : 409, "application/json", jsonText(voiceStatus()));
+  });
+  http.on("/voice/cancel", HTTP_POST, [] {
+    voiceCancel();
+    http.send(202, "application/json", jsonText(voiceStatus()));
+  });
+  http.on("/voice/reset", HTTP_POST, [] {
+    bool ok = voiceReset();
+    http.send(ok ? 202 : 409, "application/json", jsonText(voiceStatus()));
+  });
+  for (const char *path : {"/voice/ask", "/voice/say"}) {
+    bool say = String(path) == "/voice/say";
+    http.on(path, HTTP_POST, [say] {
+      String body = http.arg("plain");
+      if (body.length() > 8192) { http.send(413, "application/json", "{\"error\":\"body_too_large\"}"); return; }
+      auto *j = parseObject(body);
+      auto *value = cJSON_GetObjectItemCaseSensitive(j, "text");
+      String text = cJSON_IsString(value) ? value->valuestring : "";
+      cJSON_Delete(j); text.trim();
+      if (text.isEmpty() || text.length() > 4096) { http.send(400, "application/json", "{\"error\":\"invalid_text\"}"); return; }
+      bool ok = !batteryPolicy.shutdownDue && voiceStart(say ? VoiceMode::Say : VoiceMode::Ask, text.c_str());
+      if (ok) { userActivity(); screenDirty = true; }
+      http.send(ok ? 202 : 409, "application/json", jsonText(voiceStatus()));
+    });
+  }
+  http.on("/voice/recording.wav", HTTP_GET, [] {
+    size_t size = 0; auto *data = voiceLastRecording(size);
+    if (!data || !size) { http.send(409, "application/json", "{\"error\":\"recording_unavailable_or_busy\"}"); return; }
+    http.sendHeader("Cache-Control", "no-store");
+    http.setContentLength(size); http.send(200, "audio/wav", "");
+    for (size_t pos = 0; pos < size;) {
+      size_t count = http.client().write(data + pos, std::min(size_t(2048), size - pos));
+      if (!count) break;
+      pos += count; delay(1);
+    }
+  });
   http.on("/display/brightness", HTTP_PUT, [] {
     String raw = http.arg("plain");
     if (raw.length() > 128) {
@@ -586,6 +753,7 @@ void appSetup() {
   gfx->setBrightness(brightness);
 
   statusRowReady = statusRow.begin();
+  timeSyncSetup();
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(false);
@@ -612,10 +780,13 @@ void appSetup() {
     enableProvisioning();
   }
   boardIOSetup();
+  batteryTick();
   visualizerSetup();
   microphoneSetup();
+  voiceSetup();
   lastPwrPressHandled = boardPwrShortPressCount();
   lastTouchHandled = boardTouchSequence();
+  lastTapHandled = boardTouchTapSequence();
   httpSetup();
   Serial.printf("BADGE %s ready\n", FIRMWARE_VERSION);
   userActivity();
@@ -634,7 +805,14 @@ void appLoop() {
       }
       if (console == "status")
         Serial.println(statusJson());
-      if (console == "scan" && !connecting) {
+      if (console == "voice") {
+        if (voiceStart()) userActivity();
+        Serial.println(jsonText(voiceStatus()));
+      }
+      if (console == "voice-stop") voiceStopRecording();
+      if (console == "voice-cancel") voiceCancel();
+      if (console == "voice-reset") voiceReset();
+      if (console == "scan" && !connecting && !voiceBusy()) {
         int count = WiFi.scanNetworks();
         int matches = 0;
         for (int i = 0; i < count; ++i)
@@ -656,13 +834,37 @@ void appLoop() {
   }
   bootButtonTick();
   networkTick();
+  if (timeSyncTick(WiFi.status() == WL_CONNECTED))
+    screenDirty = true; // Do not wake the panel or reset the idle timer for NTP.
   http.handleClient();
   boardIOTick();
+  batteryTick();
   uint32_t touchSequence = boardTouchSequence();
+  uint32_t tapSequence = boardTouchTapSequence();
+  bool wasSleeping = screensaver.active || screensaver.screenOff;
   if (touchSequence != lastTouchHandled) {
     lastTouchHandled = touchSequence;
     userActivity();
     screenDirty = true;
+  }
+  if (tapSequence != lastTapHandled) {
+    lastTapHandled = tapSequence;
+    int16_t x, y; uint32_t age;
+    if (!wasSleeping && !batteryPolicy.shutdownDue && boardTouchPoint(x, y, age) &&
+        uint32_t(millis() - lastVoiceTap) >= 350) {
+      bool minus = x >= 100 && x <= 175 && y >= 338 && y <= 375;
+      bool plus = x >= 291 && x <= 366 && y >= 338 && y <= 375;
+      bool action = x >= 120 && x <= 346 && y >= 376 && y <= 427;
+      if (minus || plus || action) {
+        lastVoiceTap = millis();
+        if (minus || plus) {
+          int value = constrain(voiceVolume() + (plus ? 10 : -10), 0, 100);
+          if (!voiceSetVolume(value)) message = "Volume error\n" + voiceVolumeError();
+        } else if (voiceBusy()) { if (!voiceStopRecording()) voiceCancel(); }
+        else if (!voiceStart()) message = "Voice unavailable\n" + voiceError();
+        userActivity(); screenDirty = true;
+      }
+    }
   }
   // PWR short press cycles screen brightness.
   constexpr uint8_t levels[] = {64, 160, 255};

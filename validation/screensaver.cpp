@@ -24,4 +24,24 @@ int main() {
   assert(s.tick(5000));
   s.activity(5001);
   assert(!s.active);
+  // A maximum of five minutes of animation after the ten-second status page.
+  s.activity(1000);
+  assert(s.tick(11000) && s.active);
+  assert(!s.tick(310999) && !s.screenOff);
+  assert(s.tick(311000) && s.screenOff && !s.active);
+  assert(s.effectiveBrightness(255) == 0);
+  assert(!s.tick(500000) && s.screenOff); // polling doesn't wake a sleeping panel
+  s.activity(500001);
+  assert(!s.screenOff && !s.active && s.effectiveBrightness(255) == 255);
+  // Low battery skips animation, and can stop an already-running screensaver.
+  assert(!s.tick(510000, true));
+  assert(s.tick(510001, true) && s.screenOff);
+  s.activity(600000);
+  assert(s.tick(610000) && s.active);
+  assert(s.tick(610001, true) && s.screenOff);
+  // Late loop: go straight to off instead of starting a fresh five-minute show.
+  s.activity(0);
+  assert(s.tick(400000) && s.screenOff);
+  s.activity(UINT32_MAX - 100000);
+  assert(s.tick(209999) && s.screenOff);
 }

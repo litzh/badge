@@ -104,6 +104,7 @@ bool touchPressed = false;
 int16_t touchX = 0, touchY = 0;
 uint32_t lastTouch = 0;
 uint32_t touchSequence = 0;
+uint32_t touchTapSequence = 0;
 volatile bool touchIrqPending = false;
 
 void IRAM_ATTR onTouchIrq() { touchIrqPending = true; }
@@ -178,6 +179,7 @@ void touchPoll() {
     // setMirrorXY(true, true) with 466x466).
     touchX = 465 - x;
     touchY = 465 - y;
+    if (!touchPressed) ++touchTapSequence;
     touchPressed = true;
     lastTouch = millis();
     ++touchSequence;
@@ -399,6 +401,40 @@ bool boardTouchPoint(int16_t &x, int16_t &y, uint32_t &ageMs) {
 
 uint32_t boardPwrShortPressCount() { return pwrShortPressCount; }
 uint32_t boardTouchSequence() { return touchSequence; }
+uint32_t boardTouchTapSequence() { return touchTapSequence; }
+
+BatterySample boardBatterySample() {
+  BatterySample sample;
+  sample.valid = batteryOK;
+  sample.powerValid = powerStatusOK;
+  sample.present = batteryPresent;
+  sample.vbus = vbusPresent;
+  sample.millivolts = batteryMv;
+  sample.percent = batteryPercent;
+  sample.direction = powerStatusOK && batteryPresent ? powerDirection : -1;
+  sample.chargerStatus = powerStatusOK && batteryPresent ? chargerStatus : -1;
+  sample.sampledAt = lastBattery;
+  return sample;
+}
+
+PowerOffResult boardPowerOffIfLow(uint16_t thresholdMv) {
+  // A final fresh interlock: do not power off after USB insertion, a failed
+  // read, battery removal or voltage recovery. STATUS1 bit5 gates even VBUS
+  // which has not yet become a valid input according to STATUS2.
+  uint8_t status1, raw[2], config;
+  if (!i2cRead(AXP2101_ADDR, AXP_REG_STATUS1, &status1, 1) ||
+      !(status1 & 0x08) || (status1 & 0x20) ||
+      !i2cRead(AXP2101_ADDR, AXP_REG_VBAT_H, raw, 2))
+    return PowerOffResult::Cancelled;
+  uint16_t mv = ((raw[0] & 0x1F) << 8) | raw[1];
+  if (mv < 2000 || mv > thresholdMv)
+    return PowerOffResult::Cancelled;
+  // XPowersAXP2101::shutdown(): COMMON_CONFIG (0x10), bit0.
+  if (!i2cRead(AXP2101_ADDR, 0x10, &config, 1) ||
+      !i2cWriteReg(AXP2101_ADDR, 0x10, config | 0x01))
+    return PowerOffResult::WriteFailed;
+  return PowerOffResult::Requested;
+}
 
 void boardSetVisualActive(bool active) { imuInterval = active ? 40 : 200; }
 

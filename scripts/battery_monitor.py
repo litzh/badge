@@ -25,13 +25,14 @@ import urllib.request
 import webbrowser
 
 
-FIELDS = (
+LEGACY_FIELDS = (
     "timestamp_utc", "elapsed_seconds", "label", "device", "reachable", "error",
     "firmware", "uptime_seconds", "reboot_detected", "battery_status", "voltage_v",
     "percent", "present", "vbus_present", "power_state", "charger_status_code",
     "sample_age_ms", "screensaver", "brightness", "effective_brightness", "rssi_dbm",
     "request_ms",
 )
+FIELDS = LEGACY_FIELDS + ("screen_off", "display_mode", "battery_low", "shutdown_pending", "shutdown_status")
 MAX_RESPONSE = 128 * 1024
 TEMPLATE = Path(__file__).with_name("battery_chart.html")
 
@@ -115,6 +116,11 @@ def make_sample(status, *, elapsed, label, device, error="", request_ms=0,
         row[field] = boolean(battery.get(field))
     row["charger_status_code"] = number(battery.get("charger_status_code"))
     row["screensaver"] = boolean(display.get("screensaver"))
+    row["screen_off"] = boolean(display.get("screen_off"))
+    row["display_mode"] = display.get("mode")
+    row["battery_low"] = boolean(battery.get("low"))
+    row["shutdown_pending"] = boolean(battery.get("shutdown_pending"))
+    row["shutdown_status"] = battery.get("shutdown_status")
     for field in ("brightness", "effective_brightness"):
         row[field] = number(display.get(field))
     row["rssi_dbm"] = number(wifi.get("rssi_dbm"))
@@ -135,17 +141,19 @@ def write_report(path: Path, samples: list[dict], metadata: dict, *, running: bo
 
 
 def load_csv(path: Path) -> list[dict]:
-    boolean_fields = {"reachable", "reboot_detected", "present", "vbus_present", "screensaver"}
-    text_fields = {"timestamp_utc", "label", "device", "error", "firmware", "battery_status", "power_state"}
+    boolean_fields = {"reachable", "reboot_detected", "present", "vbus_present", "screensaver",
+                      "screen_off", "battery_low", "shutdown_pending"}
+    text_fields = {"timestamp_utc", "label", "device", "error", "firmware", "battery_status", "power_state",
+                   "display_mode", "shutdown_status"}
     rows = []
     with path.open(newline="", encoding="utf-8") as source:
         reader = csv.DictReader(source)
-        if not reader.fieldnames or not set(FIELDS).issubset(reader.fieldnames):
+        if not reader.fieldnames or not set(LEGACY_FIELDS).issubset(reader.fieldnames):
             raise ValueError("CSV 不是本程序生成的电池记录")
         for raw in reader:
             row = {}
             for field in FIELDS:
-                value = raw[field]
+                value = raw.get(field)
                 if value in (None, ""):
                     row[field] = None
                 elif field in text_fields:

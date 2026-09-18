@@ -1,0 +1,109 @@
+{
+  "source": "/Users/lance/Project/esp32/badge/recordings/20260917-180915-893121/samples.csv",
+  "sample_count": 6072,
+  "reachable_samples": 2713,
+  "discharge_start": "09-17 18:17:16",
+  "discharge_end": "09-17 22:56:56",
+  "discharge_minutes": 279.66703333333334,
+  "discharge_last_voltage_v": 2.926,
+  "charge_start": "09-18 08:16:56",
+  "charge_full": "09-18 10:58:16",
+  "charge_minutes": 161.33508333333333,
+  "cutoff_3_35_remaining_minutes": 12.499183333333333,
+  "charging_reboots": [
+    "09-18 08:56:17"
+  ],
+  "discharge_milestones": [
+    {
+      "percent": 80,
+      "time": "09-17 19:42:05",
+      "voltage_v": 3.919,
+      "remaining_minutes": 194.83
+    },
+    {
+      "percent": 50,
+      "time": "09-17 21:30:16",
+      "voltage_v": 3.693,
+      "remaining_minutes": 86.67
+    },
+    {
+      "percent": 20,
+      "time": "09-17 22:06:16",
+      "voltage_v": 3.543,
+      "remaining_minutes": 50.67
+    },
+    {
+      "percent": 15,
+      "time": "09-17 22:14:06",
+      "voltage_v": 3.512,
+      "remaining_minutes": 42.83
+    },
+    {
+      "percent": 10,
+      "time": "09-17 22:25:06",
+      "voltage_v": 3.47,
+      "remaining_minutes": 31.83
+    },
+    {
+      "percent": 5,
+      "time": "09-17 22:36:56",
+      "voltage_v": 3.418,
+      "remaining_minutes": 20.0
+    },
+    {
+      "percent": 3,
+      "time": "09-17 22:41:16",
+      "voltage_v": 3.387,
+      "remaining_minutes": 15.66
+    },
+    {
+      "percent": 1,
+      "time": "09-17 22:45:56",
+      "voltage_v": 3.325,
+      "remaining_minutes": 11.0
+    },
+    {
+      "percent": 0,
+      "time": "09-17 22:50:16",
+      "voltage_v": 3.225,
+      "remaining_minutes": 6.67
+    }
+  ],
+  "charge_milestones": [
+    {
+      "percent": 20,
+      "minutes": 39.5,
+      "voltage_v": 3.747
+    },
+    {
+      "percent": 50,
+      "minutes": 80.83,
+      "voltage_v": 3.954
+    },
+    {
+      "percent": 80,
+      "minutes": 116.0,
+      "voltage_v": 4.084
+    },
+    {
+      "percent": 90,
+      "minutes": 132.5,
+      "voltage_v": 4.127
+    },
+    {
+      "percent": 95,
+      "minutes": 144.5,
+      "voltage_v": 4.154
+    },
+    {
+      "percent": 99,
+      "minutes": 158.33,
+      "voltage_v": 4.178
+    },
+    {
+      "percent": 100,
+      "minutes": 161.34,
+      "voltage_v": 4.141
+    }
+  ]
+}

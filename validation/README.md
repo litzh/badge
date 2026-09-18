@@ -4,9 +4,18 @@
 
 ## 无需设备
 
+语音配置与协议测试：`uv run validation/test_voice_config.py`；
+`clang++ -std=c++17 -Wall -Wextra -Werror validation/voice_protocol.cpp -o /tmp/badge-voice-protocol && /tmp/badge-voice-protocol`。
+覆盖密钥不打印、构建校验/旧配置删除、提示词编码、WAV 边界/格式与 UTF-8 回答长度。
+语音实机脚本见 [语音验证](../docs/voice.md#验证)。
+
 ```sh
+clang++ -std=c++17 -Wall -Wextra -Werror -Ivalidation/time_sync_stubs validation/time_sync.cpp -o /tmp/badge-time-sync-test
+/tmp/badge-time-sync-test
 c++ -std=c++11 validation/screensaver.cpp -o /tmp/badge-screensaver-test
 /tmp/badge-screensaver-test
+c++ -std=c++11 validation/battery_policy.cpp -o /tmp/badge-battery-test
+/tmp/badge-battery-test
 c++ -std=c++11 validation/display_frame.cpp -o /tmp/badge-display-test
 /tmp/badge-display-test
 uv run validation/render_frame.py
@@ -15,26 +24,51 @@ bash -n scripts/build.sh scripts/setup_native_ctags.sh
 git diff --check
 ```
 
-- `screensaver.cpp`：10 秒计时、亮度限制、唤醒恢复、毫秒回绕。
+- `time_sync.cpp`：未同步时间隐藏、NTP 超时切换、北京时间跨日、断网走时、重连与每小时同步、异常年份拒绝、毫秒回绕。模拟网络和系统时间，不访问 USB。
+- `screensaver.cpp`：10 秒屏保、5 分钟显示上限、低电跳过屏保、亮度和唤醒、毫秒回绕。
+- `battery_policy.cpp`：连续低电压、百分比误差、USB、采样故障/过期/间断、恢复迟滞和毫秒回绕。
 - `display_frame.cpp`：全帧和奇数高度条带覆盖、源数据偏移及每次写入大小。
 - `render_frame.py`：编译执行 `visualizer.cpp`，测试音频频段、直流抑制、反相双麦、
   长时间粒子运动、边界及缓冲区哨兵；输出 `validation-output/lumina.png`。
-- `test_battery_monitor.py`：4 项测试，包含本机回环 HTTP 服务；验证失败恢复、
+- `test_battery_monitor.py`：5 项测试，包含本机回环 HTTP 服务；验证新旧 CSV 兼容、熄屏字段、失败恢复、
   有效电量 0%、重启识别、转义、数据落盘、重绘及防止覆盖。
 
 ## 编译和实机
+
+只读校时检查：`uv run validation/device_time_sync.py http://DEVICE_IP`，确认 badge 固件身份、
+指定服务器、北京时间偏移及走时，并检查轮询期间待机计时继续增长；运行期间不要触摸按键。
+该检查不唤醒或修改设备，与下方会改变显示状态的测试不同。
 
 ```sh
 bash scripts/build.sh
 uv run validation/device_visualizer.py http://DEVICE_IP
 uv run validation/device_screensaver.py http://DEVICE_IP
+uv run validation/device_screen_off.py http://DEVICE_IP
 uv run --with pyserial validation/read_serial_status.py /dev/cu.usbmodemXXXX
 ```
 
-烧录步骤见 [构建文档](../docs/build.md)。两个实机测试应顺序运行：会清空 echo、
+烧录步骤见 [构建文档](../docs/build.md)。实机测试应顺序运行：会清空 echo、
 唤醒设备，亮度测试会临时改变亮度后恢复；结束保持屏保。不要在续航采集期间运行。
 串口脚本只读取状态，输出中过滤 Wi-Fi 名称和完整配置。
+熄屏测试需要静置约 5 分半钟，持续检查 HTTP、面板模式和音频/动画计数。
+它不触发低电关机；关机分支用主机模拟输入验证，实际 PMU 断电需后续充放电实验确认。
 
 软件帧数、非黑像素统计和离线图像不能替代实际面板检查。目视确认：
 文字更新不闪烁、静置 10 秒可见粒子、触摸唤醒、声音与倾斜影响画面。
 实体 BOOT/PWR 动作需人工检查，温度和 PMU 电量不是经过独立仪器校准的测量。
+
+## 0.5.1 校时验证记录（2026-09-18）
+
+- 保留开始任务时已有的 0.5.0 未提交改动，增量增加时间模块、状态页时间行及 API 字段。
+- 烧录前串口与 HTTP 均确认原固件为 `badge-0.5.0`；USB 序列号/MAC 为
+  `80:45:6B:34:1F:30`，本次端口 `/dev/cu.usbmodem31201`，IP `192.168.8.121`。
+  端口可能变化，后续操作需重新核对。本次未操作 RLCD。
+- 校时主机测试、现有屏保和电池策略主机测试通过；Core 3.3.2-cn 编译通过，
+  应用 1,356,347 字节（43%），静态 RAM 58,504 字节（17%），USB 烧录哈希校验通过。
+- `/status` 确认 `firmware=badge-0.5.1`、`time_sync.status=synced`、`time_valid=true`、
+  `last_error=null`，服务器列表与配置一致；最近同步为 `2026-09-18T03:34:29Z`。
+- 连续读取北京时间 `11:34:34`、`11:34:39`、`11:34:45`，与主机差值约
+  0.68、0.89、0.07 秒；待机时间增长，设备保持屏保，没有被状态查询唤醒。
+- 电池、触摸、IMU 状态正常，麦克风/粒子屏保 ready，原亮度 255 保留，屏保实际亮度 128。
+- 断网走时、重连、服务器失败切换、每小时同步、异常年份和 millis 回绕由主机模拟验证；
+  未人为中断现场网络，未重新执行耗时的 310 秒熄屏实验，未将 API 数据等同于实体屏幕目视验证。
