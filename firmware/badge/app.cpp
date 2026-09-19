@@ -12,6 +12,9 @@
 #include "time_sync.h"
 #include "voice.h"
 #include "interaction.h"
+#include "local_tools.h"
+#include "device_tool_protocol.h"
+#include "shutdown_state.h"
 #include "Arduino_GFX_Library.h"
 #include "pin_config.h"
 #include <WiFi.h>
@@ -28,7 +31,7 @@
 
 namespace {
 
-constexpr char FIRMWARE_VERSION[] = "badge-0.7.0";
+constexpr char FIRMWARE_VERSION[] = "badge-0.9.0";
 
 // Round-screen geometry: 466x466 panel, visible area is the inscribed circle.
 constexpr int16_t SCREEN = 466;
@@ -49,6 +52,7 @@ uint8_t brightness = 160;
 String displayError;
 ScreensaverState screensaver;
 BatteryPolicy batteryPolicy;
+ShutdownState shutdown;
 bool panelSleeping = false;
 const char *powerOffStatus = "idle";
 uint32_t lastPowerOffAttempt = 0;
@@ -154,6 +158,7 @@ void batteryTick() {
   }
   screensaver.active = false;
   screensaver.screenOff = true;
+  shutdown.cancel("low_battery_shutdown");
   voiceCancel();
   sleepPanel();
   if (!powerOffAttempted || uint32_t(millis() - lastPowerOffAttempt) >= 5000) {
@@ -255,10 +260,13 @@ void drawRow(int16_t y, const String &text, uint16_t color, uint8_t size) {
 }
 
 String voiceTitle() {
+  if (shutdown.phase == ShutdownState::Phase::Countdown) return String("POWER OFF IN ") + shutdown.remaining(millis());
   String state = voiceLabel();
   if (state == "recording") return "LISTENING";
   if (state == "recognizing") return "RECOGNIZING";
   if (state == "thinking" || state == "shortening") return "THINKING";
+  if (state == "reading_device") return "READING DEVICE";
+  if (state == "setting_device") return "SETTING DEVICE";
   if (state == "synthesizing" || state == "downloading") return "PREPARING AUDIO";
   if (state == "playing") return "SPEAKING";
   if (state == "starting") return "STARTING";
@@ -316,10 +324,11 @@ void drawScreen() {
     if (batteryPolicy.conserve()) power += " LOW";
     drawRow(94, String(WiFi.status() == WL_CONNECTED ? "Wi-Fi OK   " : "OFFLINE   ") + power, RGB565_YELLOW, 2);
     drawRow(156, voiceTitle(), voiceRecording() ? RGB565_RED : RGB565_CYAN, 3);
-    String detail = voiceRecording() ? String("Recording: ") + voiceRecordedMs() / 1000 + "s" :
+    String detail = shutdown.active() ? (shutdown.phase == ShutdownState::Phase::Waiting ? "Shutdown queued" : "Tap below to cancel") :
+                    voiceRecording() ? String("Recording: ") + voiceRecordedMs() / 1000 + "s" :
                     !notice.isEmpty() ? notice : voiceBusy() ? "Please wait..." : voiceHint();
     drawRow(204, detail, RGB565_WHITE, 2);
-    drawRow(234, voiceRecording() ? "BOOT: send" : voiceBusy() ? "BOOT: cancel" : "BOOT: start recording", RGB565_WHITE, 2);
+    drawRow(234, shutdown.active() ? "BOOT: cancel shutdown" : voiceRecording() ? "BOOT: send" : voiceBusy() ? "BOOT: cancel" : "BOOT: start recording", RGB565_WHITE, 2);
     drawRow(420, "PWR: screen on/off", RGB565_WHITE, 1);
   } else if (page == Page::Settings) {
     drawRow(64, "SETTINGS", RGB565_CYAN, 3);
@@ -342,7 +351,7 @@ void drawScreen() {
     if (b.page != page) continue;
     String label;
     switch (b.id) {
-      case Control::Talk: label = voiceRecording() ? "Send question" : voiceBusy() ? "Cancel" : "Start talking"; break;
+      case Control::Talk: label = shutdown.active() ? "Cancel shutdown" : voiceRecording() ? "Send question" : voiceBusy() ? "Cancel" : "Start talking"; break;
       case Control::Settings: label = "Settings"; break;
       case Control::VolumeDown: case Control::BrightnessDown: label = "-"; break;
       case Control::VolumeUp: case Control::BrightnessUp: label = "+"; break;
@@ -391,7 +400,7 @@ void drawScreensaver(bool first) {
 
 void displayTick() {
   bool speaking = voiceBusy();
-  if (speaking || voiceWasBusy) screensaver.keepAwake(millis());
+  if (speaking || voiceWasBusy || shutdown.active()) screensaver.keepAwake(millis());
   if (!notice.isEmpty() && int32_t(millis() - noticeUntil) >= 0) { notice = ""; screenDirty = true; }
   if (feedbackButton != Control::None && int32_t(millis() - feedbackUntil) >= 0) {
     feedbackButton = Control::None; screenDirty = true;
@@ -591,6 +600,29 @@ void networkTick() {
 // ---------------------------------------------------------------------------
 // HTTP API
 // ---------------------------------------------------------------------------
+cJSON *deviceToolSnapshot(uint32_t fields) {
+  DeviceTool::Snapshot s;
+  s.now = millis(); s.battery = boardBatterySample();
+  auto motion = boardMotion();
+  s.motionValid = motion.valid; s.motionAge = motion.sampleAgeMs;
+  s.accel[0] = motion.ax; s.accel[1] = motion.ay; s.accel[2] = motion.az;
+  s.gyro[0] = motion.gx; s.gyro[1] = motion.gy; s.gyro[2] = motion.gz;
+  s.temperatureValid = motion.temperatureValid; s.temperatureAge = motion.temperatureAgeMs; s.temperatureC = motion.temperatureC;
+  s.brightness = brightness; s.effectiveBrightness = effectiveBrightness();
+  s.screenOff = screensaver.screenOff; s.screensaver = screensaver.active; s.manualOff = screensaver.manualOff;
+  s.volume = voiceVolume(); s.connected = WiFi.status() == WL_CONNECTED;
+  if (s.connected) s.rssi = WiFi.RSSI();
+  return DeviceTool::reading(s, fields);
+}
+cJSON *shutdownStatus() {
+  auto *j = cJSON_CreateObject();
+  cJSON_AddStringToObject(j, "state", shutdown.label());
+  cJSON_AddNumberToObject(j, "remaining_seconds", shutdown.remaining(millis()));
+  cJSON_AddNumberToObject(j, "delay_seconds", 10);
+  cJSON_AddStringToObject(j, "countdown_starts", "after_reply_completed");
+  cJSON_AddStringToObject(j, "reason", shutdown.reason);
+  return j;
+}
 String statusJson() {
   cJSON *j = cJSON_CreateObject();
   cJSON_AddStringToObject(j, "firmware", FIRMWARE_VERSION);
@@ -620,6 +652,7 @@ String statusJson() {
   addDisplayState(cJSON_AddObjectToObject(j, "display"));
   cJSON_AddItemToObject(j, "microphone", microphoneStatus());
   cJSON_AddItemToObject(j, "voice", voiceStatus());
+  cJSON_AddItemToObject(j, "shutdown", shutdownStatus());
   cJSON_AddItemToObject(j, "visualizer", visualizerStatus());
   return jsonText(j);
 }
@@ -636,7 +669,7 @@ String displayJson() {
 }
 
 bool setBrightness(uint8_t value) {
-  if (!displayStorageOK || displayPrefs.putUChar("brightness", value) != 1) {
+  if (!displayStorageOK || (value != brightness && displayPrefs.putUChar("brightness", value) != 1)) {
     displayError = "display_save_failed";
     Serial.println("DISPLAY brightness save failed");
     return false;
@@ -648,7 +681,58 @@ bool setBrightness(uint8_t value) {
   return true;
 }
 
+cJSON *deviceToolExecute(const DeviceTool::Command &command) {
+  using DeviceTool::Operation;
+  if (command.operation == Operation::Read) return deviceToolSnapshot(command.fields);
+  if (batteryPolicy.shutdownDue) return DeviceTool::error("low_battery_shutdown");
+  if (command.operation == Operation::Shutdown) {
+    auto progress = voiceProgress();
+    if (!progress.busy || progress.cancelled || !shutdown.schedule(progress.turn))
+      return DeviceTool::error("shutdown_cancelled_or_busy");
+    userActivity(); showPage(Page::Home);
+    auto *result = shutdownStatus();
+    cJSON_AddBoolToObject(result, "ok", true);
+    return result;
+  }
+  bool volume = command.operation == Operation::Volume;
+  bool ok = volume ? voiceSetVolume(command.value) : setBrightness((command.value * 255 + 50) / 100);
+  if (!ok) return DeviceTool::error(volume ? voiceVolumeError().c_str() : displayError.c_str());
+  userActivity(); screenDirty = true;
+  auto *result = deviceToolSnapshot(volume ? DeviceTool::Audio : DeviceTool::Display);
+  cJSON_AddNumberToObject(result, "saved_percent", volume ? voiceVolume() : (brightness * 100 + 127) / 255);
+  return result;
+}
+
+void cancelShutdown() {
+  if (!shutdown.active()) return;
+  shutdown.cancel("user_cancelled"); voiceCancel();
+  userActivity(); showPage(Page::Home); showNotice("Shutdown cancelled");
+}
+
+void shutdownTick() {
+  auto before = shutdown.phase;
+  auto progress = voiceProgress();
+  if (shutdown.tick(millis(), progress.turn, progress.busy, progress.cancelled, progress.done && progress.shutdownAccepted)) {
+    screensaver.sleep(); sleepPanel();
+    if (boardPowerOff() != PowerOffResult::Requested) shutdown.fail("power_off_write_failed");
+  }
+  // A successful register write is not proof that the PMU removed power.
+  if (shutdown.phase == ShutdownState::Phase::Requested && uint32_t(millis() - shutdown.started) >= 2000)
+    shutdown.fail("power_off_not_completed");
+  if (before != shutdown.phase) {
+    screenDirty = true;
+    if (shutdown.phase == ShutdownState::Phase::Countdown) showPage(Page::Home);
+    if (shutdown.phase == ShutdownState::Phase::Failed) {
+      userActivity(); showPage(Page::Home); showNotice("Shutdown failed: use PWR");
+    }
+  }
+}
+
 void httpSetup() {
+  http.on("/shutdown/cancel", HTTP_POST, [] {
+    cancelShutdown();
+    http.send(200, "application/json", jsonText(shutdownStatus()));
+  });
   http.on("/status", HTTP_GET, [] { http.send(200, "application/json", statusJson()); });
   http.on("/display", HTTP_GET, [] { http.send(200, "application/json", displayJson()); });
   http.on("/visualizer", HTTP_GET, [] { http.send(200, "application/json", jsonText(visualizerStatus())); });
@@ -685,10 +769,12 @@ void httpSetup() {
     http.send(ok ? 202 : 409, "application/json", jsonText(voiceStatus()));
   });
   http.on("/voice/cancel", HTTP_POST, [] {
+    cancelShutdown();
     voiceCancel();
     http.send(202, "application/json", jsonText(voiceStatus()));
   });
   http.on("/voice/reset", HTTP_POST, [] {
+    cancelShutdown();
     bool ok = voiceReset();
     http.send(ok ? 202 : 409, "application/json", jsonText(voiceStatus()));
   });
@@ -699,10 +785,14 @@ void httpSetup() {
       if (body.length() > 8192) { http.send(413, "application/json", "{\"error\":\"body_too_large\"}"); return; }
       auto *j = parseObject(body);
       auto *value = cJSON_GetObjectItemCaseSensitive(j, "text");
+      auto *speak = cJSON_GetObjectItemCaseSensitive(j, "speak");
+      bool validSpeak = !speak || (!say && cJSON_IsBool(speak));
+      bool textOnly = !say && cJSON_IsFalse(speak);
       String text = cJSON_IsString(value) ? value->valuestring : "";
       cJSON_Delete(j); text.trim();
+      if (!validSpeak) { http.send(400, "application/json", "{\"error\":\"invalid_speak\"}"); return; }
       if (text.isEmpty() || text.length() > 4096) { http.send(400, "application/json", "{\"error\":\"invalid_text\"}"); return; }
-      bool ok = !batteryPolicy.shutdownDue && voiceStart(say ? VoiceMode::Say : VoiceMode::Ask, text.c_str());
+      bool ok = !batteryPolicy.shutdownDue && voiceStart(say ? VoiceMode::Say : textOnly ? VoiceMode::AskText : VoiceMode::Ask, text.c_str());
       if (ok) { userActivity(); screenDirty = true; }
       http.send(ok ? 202 : 409, "application/json", jsonText(voiceStatus()));
     });
@@ -775,6 +865,7 @@ String ascii(const String &s) {
 }
 
 bool controlEnabled(Control id) {
+  if (shutdown.active() && id != Control::Talk) return false;
   switch (id) {
     case Control::VolumeDown: return voiceVolume() > 0;
     case Control::VolumeUp: return voiceVolume() < 100;
@@ -787,6 +878,9 @@ bool controlEnabled(Control id) {
 
 void performVoiceAction(BadgeUI::VoiceAction action) {
   if (batteryPolicy.shutdownDue) return;
+  if (shutdown.active()) {
+    cancelShutdown(); feedbackButton = Control::Talk; feedbackUntil = millis() + 160; return;
+  }
   userActivity(); showPage(Page::Home);
   // A touch released after the voice state changed must not start another job.
   if (action == BadgeUI::VoiceAction::Start) {
@@ -915,6 +1009,7 @@ void appSetup() {
   visualizerSetup();
   microphoneSetup();
   voiceSetup();
+  if (!localToolsSetup()) Serial.println("TOOLS queue allocation failed");
   lastPwrPressHandled = boardPwrShortPressCount();
   bootButton.update(digitalRead(0) == LOW, millis());
   httpSetup();
@@ -940,8 +1035,8 @@ void appLoop() {
         Serial.println(jsonText(voiceStatus()));
       }
       if (console == "voice-stop") voiceStopRecording();
-      if (console == "voice-cancel") voiceCancel();
-      if (console == "voice-reset") voiceReset();
+      if (console == "voice-cancel") { cancelShutdown(); voiceCancel(); }
+      if (console == "voice-reset") { cancelShutdown(); voiceReset(); }
       if (console == "scan" && !connecting && !voiceBusy()) {
         int count = WiFi.scanNetworks();
         int matches = 0;
@@ -971,6 +1066,8 @@ void appLoop() {
   batteryTick();
   touchTick();
   pwrButtonTick();
+  localToolsPoll(deviceToolExecute);
+  shutdownTick();
   displayTick();
   delay(2);
 }

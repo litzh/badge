@@ -24,10 +24,13 @@ bool boardBattery(uint16_t &mv, bool &ok);
 BatterySample boardBatterySample();
 enum class PowerOffResult { Cancelled, WriteFailed, Requested };
 PowerOffResult boardPowerOffIfLow(uint16_t thresholdMv);
+// Explicit user-requested shutdown, main loop only.
+PowerOffResult boardPowerOff();
 
 struct BoardMotion {
   bool valid = false, temperatureValid = false;
-  float ax = 0, ay = 0, az = 1, gz = 0, temperatureC = 32;
+  float ax = 0, ay = 0, az = 1, gx = 0, gy = 0, gz = 0, temperatureC = 32;
+  uint32_t sampleAgeMs = UINT32_MAX, temperatureAgeMs = UINT32_MAX;
 };
 BoardMotion boardMotion();
 void boardSetVisualActive(bool active);

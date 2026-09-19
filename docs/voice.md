@@ -1,6 +1,6 @@
 # 设备语音问答
 
-`badge-0.7.0`：ES7210 录音 → MiniMax `asr-1.0` → DeepSeek `deepseek-flash`（服务端搜索）→ MiniMax `speech-2.8-turbo` → ES8311 扬声器播放。设备直接通过 Wi-Fi 访问服务，无需电脑中转。
+`badge-0.9.0`：ES7210 录音 → MiniMax `asr-1.0` → DeepSeek `deepseek-flash`（服务端搜索）→ MiniMax `speech-2.8-turbo` → ES8311 扬声器播放。设备直接通过 Wi-Fi 访问服务，无需电脑中转。
 
 ## 构建参数
 
@@ -54,7 +54,7 @@ bash scripts/build.sh
 | `POST /voice/stop` | 结束录音并提交；非录音状态返回 409 |
 | `POST /voice/cancel` | 请求取消；不会清空上一轮成功的上下文 |
 | `POST /voice/reset` | 空闲时清空上下文；忙碌返回 409 |
-| `POST /voice/ask` | `{"text":"一加一等于几？"}`，跳过录音和 ASR，问答后播放 |
+| `POST /voice/ask` | `{"text":"一加一等于几？"}`，跳过录音和 ASR，问答后播放；可选 `"speak":false` 仅返回文字，不合成/播放、不写入会话历史 |
 | `POST /voice/say` | `{"text":"你好，设备语音测试。"}`，直接 TTS 播放，最多 160 字符 |
 | `GET /voice/recording.wav` | 空闲时下载最后一次录音；重启或下次录音覆盖；忙碌返回 409 |
 
@@ -62,9 +62,51 @@ bash scripts/build.sh
 
 串口命令：`voice` 开始问答录音，`voice-stop` 结束，`voice-cancel` 取消，`voice-reset` 清空上下文；`status` 包含 `voice` 对象。
 
-状态流程：`starting → recording → recognizing → thinking → [shortening] → synthesizing → downloading → playing → done`。异常进入 `error` 并保留 `failed_stage` 与错误码；取消进入 `cancelled`。网络阶段的取消要等待当前有界网络读写结束，TLS 建连最长约 10 秒；播放期间通常在下一个音频块停止。
+状态流程：`starting → recording → recognizing → thinking ↔ [reading_device] → [shortening] → synthesizing → downloading → playing → done`。异常进入 `error` 并保留 `failed_stage` 与错误码；取消进入 `cancelled`。网络阶段的取消要等待当前有界网络读写结束，TLS 建连最长约 10 秒；播放期间通常在下一个音频块停止。
 
 状态的 `volume` 是当前音量，`default_volume` 是构建默认值，`volume_error` 单独报告音量设置失败，不覆盖问答结果。仅值变化时写入 NVS；保存失败保留原音量。音频任务在播放块之间应用变化，UI/HTTP 不直接操作正在播放的编解码器。
+
+## 本地设备工具
+
+`read_device_state({"fields":["battery","audio"]})` 在 badge 上执行；DeepSeek 仍在云端推理，工具结果会作为当前轮上下文发送给 DeepSeek。
+仅接受 `fields` 字段及白名单中的 1–6 个不重复值，不接受任意代码、URL 或设备写操作：
+
+| 字段 | 内容与限制 |
+| --- | --- |
+| `battery` | 电量估计、电压、USB 供电、充放电状态；最长样本年龄 7.5 秒，不推算准确续航 |
+| `motion` | 即时三轴加速度（g）、角速度（度/秒）；近似静止时给出屏幕朝上为 0° 的倾角，运动时倾角为 null；不提供朝向南北、位置或移动历史 |
+| `chip_temperature` | QMI8658 芯片内部温度（℃），最长样本年龄 5 秒；不是室温或体温 |
+| `display` | 保存/实际亮度（0–255）、屏幕状态和手动熄屏标志 |
+| `audio` | 音量（0–100）及静音状态 |
+| `network` | Wi-Fi 是否连接和 RSSI（dBm）；不含密码、SSID、IP 等网络配置 |
+
+传感器数据有 `status` 和 `sample_age_ms`，无效/过期测量为 null。`ok:true` 表示成功取得快照，不代表每组传感器都有效；读取时必须检查各组状态。
+由主循环构造指定字段的快照，语音线程通过队列请求，不在后台线程直接访问共享 I²C；队列等待最多 2 秒，支持取消并隔离旧响应。
+
+模型可以在一轮里同时使用云端搜索和本地读取，程序保留完整工具消息并按调用 ID 回传结果。每轮最多实际执行 4 次本地调用、6 次模型请求（含续接和缩写），模型阶段总预算 90 秒；网络阻塞按当前有界超时退出。
+未知工具、无效字段、超时等以 `ok:false` 和错误码返回，模型不能把失败当作测量值。工具中间文字不朗读，最终回答仍最多 160 字符。
+
+`GET /voice` / `/status.voice` 增加 `local_tool_calls`、`last_tool`、`last_tool_result`，后者只保留最近一次工具结果。屏幕短暂显示 `READING DEVICE`，BOOT 可取消当前轮，PWR 手动熄屏行为保持不变。
+
+可以直接问：“还有多少电？”、“现在音量多少？”、“设备倾斜了吗？”、“芯片温度多少？”、“Wi-Fi 信号好吗？”。
+设备没有环境温湿度、定位或指南针能力。
+
+修改工具同样在主循环执行，不允许模型访问任意寄存器、路径或代码：
+
+| 工具 | 参数 | 行为 |
+| --- | --- | --- |
+| `set_volume` | `{"percent":30}`，整数 0–100 | 先保存 NVS，成功后应用；0 静音 |
+| `set_brightness` | `{"percent":50}`，整数 1–100 | 换算成 0–255 并保存，50% 对应 128；低电保护仍限制有效亮度 |
+| `schedule_shutdown` | `{"delay_seconds":10}`，仅支持 10 | 等本轮回答成功播完后开始 10 秒倒计时；静默请求则等待文字回答完成 |
+
+可说“亮度调到百分之五十”“音量调小一点”“十秒后关机”。未指定幅度的相对设置先读取当前值，再增减 10 个百分点。
+只有用户明确的操作请求才调用修改工具；失败不能声称成功。排队请求取消或超时后不会补执行；已开始保存的设置不能因对话取消而回滚，结果不确定时返回 `operation_outcome_unknown`，应先读取确认，不盲目重试。
+关机计划只在内存中保存，绑定本轮对话；回答/播放失败、取消或新一轮对话都会撤销。收到成功工具结果且本轮正常结束后才开始倒计时，重复调度不延长计时。
+屏幕显示 `POWER OFF IN 10` 并逐秒更新，BOOT 或 `Cancel shutdown` 按钮可取消（等待回答时也有效）。PWR 仍只控制屏幕；取消关机接口为 `POST /shutdown/cancel`，状态见 `/status.shutdown`。
+到期通过 AXP2101 的关机寄存器请求断电，不重启、不进入屏保。写入失败或 2 秒后仍在运行会显示失败，不自动重复关机；USB 连接时的实际断电/再上电表现需实机体验确认。
+
+静默联调：`uv run validation/device_tools.py http://DEVICE_IP`，增加 `--search` 同时验证服务端搜索。会调用 DeepSeek 并唤醒页面，但不录音、不合成、不播放、不修改音量亮度、不写入对话历史。
+设置联调：`uv run validation/device_settings.py http://DEVICE_IP`，短暂更改并恢复音量/亮度，验证关机倒计时后立即取消，不测试实际切断电源。
 
 ## 资源与传输
 

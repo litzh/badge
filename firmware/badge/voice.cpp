@@ -2,6 +2,8 @@
 #include "audio_hw.h"
 #include "microphone.h"
 #include "voice_protocol.h"
+#include "local_tools.h"
+#include "device_tool_protocol.h"
 #include "pin_config.h"
 #if __has_include("voice_defaults.h")
 #include "voice_defaults.h"
@@ -40,6 +42,8 @@ struct Snapshot {
   char question[4097] = "", answer[1025] = "", trace[128] = "";
   uint32_t turn = 0, recordedMs = 0, asrMs = 0, llmMs = 0, ttsMs = 0, playbackMs = 0;
   unsigned searches = 0, historyTurns = 0;
+  unsigned localCalls = 0;
+  char lastTool[129] = "", lastToolResult[3072] = "";
   unsigned micChannel = 0;
   float channelRms[2] = {};
 };
@@ -47,6 +51,7 @@ Snapshot current;
 portMUX_TYPE stateLock = portMUX_INITIALIZER_UNLOCKED;
 std::atomic<bool> busy{false}, cancelled{false}, stopRecording{false};
 std::atomic<bool> recordingNow{false};
+std::atomic<bool> shutdownAccepted{false};
 bool ready = false;
 Preferences volumePrefs;
 bool volumeStorageOK = false;
@@ -58,6 +63,12 @@ std::deque<std::pair<String, String>> history; // Worker only; reset is a queued
 std::atomic<bool> resetPending{false};
 uint8_t *recorded = nullptr;
 size_t recordedSize = 0;
+bool completionActive = false; // Voice worker only; includes shortening.
+uint32_t completionStarted = 0;
+unsigned completionRequests = 0;
+bool completionExpired() {
+  return completionActive && uint32_t(millis() - completionStarted) >= DeviceTool::LLM_TIMEOUT_MS;
+}
 
 bool hasError() {
   portENTER_CRITICAL(&stateLock); bool error = current.error[0]; portEXIT_CRITICAL(&stateLock); return error;
@@ -114,10 +125,16 @@ struct Part { const uint8_t *data; size_t size; };
 bool request(const String &url, const char *provider, const char *contentType,
              const std::vector<Part> &parts, Buffer &out, size_t limit) {
   if (cancelled.load()) return false;
+  if (completionExpired()) { fail("llm_timeout"); return false; }
   if (!url.startsWith("https://")) { fail("https_required"); return false; }
   esp_http_client_config_t cfg = {};
   cfg.url = url.c_str(); cfg.crt_bundle_attach = esp_crt_bundle_attach;
   cfg.timeout_ms = 10000; cfg.buffer_size = 4096;
+  if (completionActive) {
+    uint32_t elapsed = millis() - completionStarted;
+    if (elapsed >= DeviceTool::LLM_TIMEOUT_MS) { fail("llm_timeout"); return false; }
+    cfg.timeout_ms = std::min(uint32_t(10000), DeviceTool::LLM_TIMEOUT_MS - elapsed);
+  }
   cfg.disable_auto_redirect = true;
   auto h = esp_http_client_init(&cfg);
   if (!h) { fail("http_init_failed"); return false; }
@@ -144,6 +161,7 @@ bool request(const String &url, const char *provider, const char *contentType,
       int count = esp_http_client_write(h, (const char *)p.data + pos, std::min(size_t(4096), p.size - pos));
       if (count <= 0) { fail("upload_failed"); return false; }
       pos += count;
+      if (completionExpired()) { fail("llm_timeout"); return false; }
       if (uint32_t(millis() - started) > 120000) { fail("request_timeout"); return false; }
       vTaskDelay(1);
     }
@@ -151,6 +169,7 @@ bool request(const String &url, const char *provider, const char *contentType,
   int64_t declared;
   do {
     if (cancelled.load()) return false;
+    if (completionExpired()) { fail("llm_timeout"); return false; }
     if (uint32_t(millis() - started) > 120000) { fail("request_timeout"); return false; }
     declared = esp_http_client_fetch_headers(h);
   } while (declared == -ESP_ERR_HTTP_EAGAIN);
@@ -163,6 +182,7 @@ bool request(const String &url, const char *provider, const char *contentType,
   char block[2048];
   while (!esp_http_client_is_complete_data_received(h)) {
     if (cancelled.load()) return false;
+    if (completionExpired()) { fail("llm_timeout"); return false; }
     if (uint32_t(millis() - started) > 120000) { fail("request_timeout"); return false; }
     int count = esp_http_client_read(h, block, sizeof(block));
     if (count == -ESP_ERR_HTTP_EAGAIN) continue;
@@ -267,7 +287,7 @@ void addMessage(cJSON *messages, const char *role, const String &text) {
   cJSON_AddItemToArray(messages, message);
 }
 
-String complete(cJSON *messages, const String &system, bool search) {
+String complete(cJSON *messages, const String &system, bool allowTools) {
   auto body = owned(cJSON_CreateObject());
   cJSON_AddStringToObject(body.get(), "model", VOICE_LLM_MODEL);
   cJSON_AddStringToObject(body.get(), "system", system.c_str());
@@ -277,40 +297,85 @@ String complete(cJSON *messages, const String &system, bool search) {
   auto *msg = cJSON_Duplicate(messages, true);
   if (!msg) { fail("messages_allocation_failed"); return ""; }
   cJSON_AddItemToObject(body.get(), "messages", msg);
-  unsigned searches = 0;
-  if (search) {
-    auto *tools = cJSON_AddArrayToObject(body.get(), "tools"), *tool = cJSON_CreateObject();
-    cJSON_AddStringToObject(tool, "type", "web_search_20260209");
-    cJSON_AddStringToObject(tool, "name", "web_search");
-    cJSON_AddNumberToObject(tool, "max_uses", 2); cJSON_AddItemToArray(tools, tool);
+  unsigned searches = 0, localCalls = 0;
+  cJSON *webTool = nullptr;
+  if (allowTools) {
+    auto *tools = cJSON_AddArrayToObject(body.get(), "tools");
+    webTool = cJSON_CreateObject();
+    cJSON_AddStringToObject(webTool, "type", "web_search_20260209");
+    cJSON_AddStringToObject(webTool, "name", "web_search");
+    cJSON_AddNumberToObject(webTool, "max_uses", 2); cJSON_AddItemToArray(tools, webTool);
+    auto *local = DeviceTool::definition();
+    if (!local) { fail("tool_schema_allocation_failed"); return ""; }
+    cJSON_AddItemToArray(tools, local);
+    DeviceTool::addWriteDefinitions(tools);
   }
-  for (int attempt = 0; attempt < 3 && !cancelled.load(); ++attempt) {
+  for (unsigned attempt = 0; attempt < DeviceTool::MAX_REQUESTS && !cancelled.load(); ++attempt) {
+    if (completionExpired()) { fail("llm_timeout"); return ""; }
+    if (completionRequests >= DeviceTool::MAX_REQUESTS) { fail("llm_request_limit"); return ""; }
+    // Reserve the final request for the answer, and stop asking for more tools
+    // once the per-turn local budget is used up.
+    if (allowTools && (completionRequests + 1 == DeviceTool::MAX_REQUESTS || localCalls >= DeviceTool::MAX_CALLS)) {
+      cJSON_DeleteItemFromObjectCaseSensitive(body.get(), "tool_choice");
+      cJSON_AddStringToObject(cJSON_AddObjectToObject(body.get(), "tool_choice"), "type", "none");
+    }
+    ++completionRequests;
     auto reply = postJson("https://api.deepseek.com/anthropic/v1/messages", "deepseek", body.get());
     if (!reply) return "";
+    if (completionExpired()) { fail("llm_timeout"); return ""; }
+    if (cancelled.load()) return "";
     auto *blocks = get(reply.get(), "content");
-    if (!cJSON_IsArray(blocks)) { fail("invalid_llm_content"); return ""; }
+    int calls = DeviceTool::callCount(blocks);
+    if (calls < 0) { fail("invalid_llm_tool_calls"); return ""; }
     String text;
     cJSON *block;
     cJSON_ArrayForEach(block, blocks) {
       const char *type = str(block, "type");
       if (!strcmp(type, "server_tool_use")) { ++searches; text = ""; }
-      else if (!strcmp(type, "web_search_tool_result")) text = "";
+      else if (!strcmp(type, "web_search_tool_result") || !strcmp(type, "tool_use")) text = "";
       else if (!strcmp(type, "text")) text += str(block, "text");
     }
     portENTER_CRITICAL(&stateLock); current.searches = std::max(current.searches, searches); portEXIT_CRITICAL(&stateLock);
+    if (webTool) cJSON_SetNumberValue(get(webTool, "max_uses"), searches >= 2 ? 0 : 2 - searches);
     const char *stop = str(reply.get(), "stop_reason");
-    if (!strcmp(stop, "end_turn") || !strcmp(stop, "stop_sequence")) {
+    if (!calls && (!strcmp(stop, "end_turn") || !strcmp(stop, "stop_sequence"))) {
       std::string cleaned = VoiceProtocol::spoken(text.c_str());
       return String(cleaned.c_str());
     }
-    if (strcmp(stop, "pause_turn")) { fail("llm_reply_incomplete"); return ""; }
-    auto *content = cJSON_Duplicate(blocks, true);
-    if (!content) { fail("continuation_allocation_failed"); return ""; }
-    auto *assistant = cJSON_CreateObject();
-    cJSON_AddStringToObject(assistant, "role", "assistant");
-    cJSON_AddItemToObject(assistant, "content", content); cJSON_AddItemToArray(msg, assistant);
-    auto *tool = cJSON_GetArrayItem(get(body.get(), "tools"), 0);
-    if (tool) cJSON_SetNumberValue(get(tool, "max_uses"), searches >= 2 ? 0 : 2 - searches);
+    bool localTurn = calls && (!strcmp(stop, "tool_use") || !strcmp(stop, "pause_turn"));
+    if ((!localTurn && strcmp(stop, "pause_turn")) || (calls && !allowTools)) {
+      fail("llm_reply_incomplete"); return "";
+    }
+    if (!DeviceTool::appendAssistant(msg, blocks)) { fail("continuation_allocation_failed"); return ""; }
+    if (!calls) continue; // Server-side web search paused; preserve all opaque blocks.
+    auto results = owned(cJSON_CreateArray());
+    cJSON_ArrayForEach(block, blocks) {
+      if (strcmp(str(block, "type"), "tool_use")) continue;
+      if (cancelled.load()) return "";
+      const char *name = str(block, "name");
+      state(!strcmp(name, DeviceTool::NAME) ? "reading_device" : "setting_device");
+      auto result = owned(localCalls < DeviceTool::MAX_CALLS ? localToolsCall(name, get(block, "input"), cancelled) : DeviceTool::error("tool_call_limit"));
+      ++localCalls;
+      if (cancelled.load()) return "";
+      if (!result) { fail("tool_result_allocation_failed"); return ""; }
+      if (!strcmp(name, "schedule_shutdown") && cJSON_IsTrue(get(result.get(), "ok"))) shutdownAccepted.store(true);
+      String value = jsonText(result.get());
+      portENTER_CRITICAL(&stateLock);
+      current.localCalls = localCalls;
+      strlcpy(current.lastTool, name, sizeof(current.lastTool));
+      strlcpy(current.lastToolResult, value.c_str(), sizeof(current.lastToolResult));
+      portEXIT_CRITICAL(&stateLock);
+      auto *entry = DeviceTool::toolResult(str(block, "id"), result.get());
+      if (!entry) { fail("tool_result_allocation_failed"); return ""; }
+      cJSON_AddItemToArray(results.get(), entry);
+    }
+    // All results for parallel calls go in ONE user message, immediately after
+    // the complete assistant content (including server search/thinking blocks).
+    auto *user = cJSON_CreateObject();
+    if (!user || !results) { cJSON_Delete(user); fail("tool_result_allocation_failed"); return ""; }
+    cJSON_AddStringToObject(user, "role", "user");
+    cJSON_AddItemToObject(user, "content", results.release()); cJSON_AddItemToArray(msg, user);
+    state("thinking");
   }
   if (!cancelled.load()) fail("llm_continuation_limit");
   return "";
@@ -318,6 +383,8 @@ String complete(cJSON *messages, const String &system, bool search) {
 
 String answer(const String &question) {
   state("thinking"); uint32_t started = millis();
+  completionStarted = started; completionRequests = 0; completionActive = true;
+  struct EndCompletion { ~EndCompletion() { completionActive = false; } } endCompletion;
   auto messages = owned(cJSON_CreateArray());
   for (auto &turn : history) { addMessage(messages.get(), "user", turn.first); addMessage(messages.get(), "assistant", turn.second); }
   addMessage(messages.get(), "user", question);
@@ -398,9 +465,10 @@ void worker(void *) {
       portENTER_CRITICAL(&stateLock); current.historyTurns = 0; current.question[0] = current.answer[0] = 0; portEXIT_CRITICAL(&stateLock);
       state("idle"); busy.store(false); continue;
     }
-    bool lease = microphoneAcquire();
-    bool ok = lease;
-    if (!lease) fail("audio_busy_or_unavailable");
+    bool textOnly = job.mode == VoiceMode::AskText;
+    bool lease = !textOnly && microphoneAcquire();
+    bool ok = textOnly || lease;
+    if (!ok) fail("audio_busy_or_unavailable");
     bool record = job.mode == VoiceMode::Chat || job.mode == VoiceMode::Echo || job.mode == VoiceMode::Loopback;
     if (ok && record) ok = capture();
     String question = job.text, reply;
@@ -410,13 +478,13 @@ void worker(void *) {
       else setText(false, question);
       ok = !question.isEmpty();
       if (ok && !cancelled.load()) {
-        bool chat = job.mode == VoiceMode::Chat || job.mode == VoiceMode::Ask;
+        bool chat = job.mode == VoiceMode::Chat || job.mode == VoiceMode::Ask || textOnly;
         reply = chat ? answer(question) : question;
         ok = !reply.isEmpty();
         if (ok && !cancelled.load()) {
           setText(true, reply);
-          ok = synthesize(reply);
-          if (ok && chat) {
+          ok = textOnly || synthesize(reply);
+          if (ok && chat && !textOnly) {
             history.push_back({question, reply});
             while (history.size() > 6) history.pop_front();
             portENTER_CRITICAL(&stateLock); current.historyTurns = history.size(); portEXIT_CRITICAL(&stateLock);
@@ -455,6 +523,15 @@ void voiceSetup() {
 bool voiceConfigured() { return VOICE_MINIMAX_KEY[0] && VOICE_DEEPSEEK_KEY[0] && VOICE_SYSTEM_PROMPT[0]; }
 bool voiceBusy() { return busy.load(); }
 bool voiceRecording() { return recordingNow.load(); }
+VoiceProgress voiceProgress() {
+  VoiceProgress result{};
+  result.busy = busy.load(); result.cancelled = cancelled.load();
+  result.shutdownAccepted = shutdownAccepted.load();
+  portENTER_CRITICAL(&stateLock);
+  result.turn = current.turn; result.done = !strcmp(current.state, "done");
+  portEXIT_CRITICAL(&stateLock);
+  return result;
+}
 uint32_t voiceRecordedMs() {
   portENTER_CRITICAL(&stateLock); uint32_t ms = current.recordedMs; portEXIT_CRITICAL(&stateLock); return ms;
 }
@@ -480,14 +557,14 @@ bool voiceStart(VoiceMode mode, const char *text) {
     if (time(nullptr) < 1700000000) return reject("waiting_for_ntp");
   }
   size_t length = strlen(text);
-  if (length > 4096 || ((mode == VoiceMode::Ask || mode == VoiceMode::Say) && !length)) return reject("invalid_text");
+  if (length > 4096 || ((mode == VoiceMode::Ask || mode == VoiceMode::Say || mode == VoiceMode::AskText) && !length)) return reject("invalid_text");
   if (mode == VoiceMode::Say && VoiceProtocol::utf8Length(text) > 160) return reject("text_too_long");
   Job job = {}; job.mode = mode; strlcpy(job.text, text, sizeof(job.text));
   portENTER_CRITICAL(&stateLock);
   uint32_t turn = current.turn + 1; unsigned historyTurns = current.historyTurns;
   memset(&current, 0, sizeof(current)); current.turn = turn; current.historyTurns = historyTurns;
   portEXIT_CRITICAL(&stateLock);
-  cancelled.store(false); stopRecording.store(false); busy.store(true);
+  cancelled.store(false); stopRecording.store(false); shutdownAccepted.store(false); busy.store(true);
   state("starting");
   if (xQueueSend(jobs, &job, 0) != pdTRUE) { fail("queue_full"); state("error"); busy.store(false); return false; }
   return true;
@@ -544,5 +621,10 @@ cJSON *voiceStatus() {
   cJSON_AddNumberToObject(j, "llm_ms", s.llmMs); cJSON_AddNumberToObject(j, "tts_ms", s.ttsMs);
   cJSON_AddNumberToObject(j, "playback_ms", s.playbackMs); cJSON_AddNumberToObject(j, "searches", s.searches);
   cJSON_AddNumberToObject(j, "history_turns", s.historyTurns);
+  cJSON_AddNumberToObject(j, "local_tool_calls", s.localCalls);
+  cJSON_AddStringToObject(j, "last_tool", s.lastTool);
+  auto *toolResult = s.lastToolResult[0] ? cJSON_Parse(s.lastToolResult) : nullptr;
+  if (toolResult) cJSON_AddItemToObject(j, "last_tool_result", toolResult);
+  else cJSON_AddNullToObject(j, "last_tool_result");
   return j;
 }

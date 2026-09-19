@@ -1,6 +1,6 @@
 # Badge HTTP API
 
-固件 `badge-0.7.0`。所有接口在 80 端口，JSON 请求体**必须带
+固件 `badge-0.9.0`。所有接口在 80 端口，JSON 请求体**必须带
 `Content-Type: application/json`**，否则 ESP32 WebServer 会按表单解析导致
 `plain` 体为空（错误信息会有误导性）。
 
@@ -8,7 +8,7 @@
 
 ```json
 {
-  "firmware": "badge-0.7.0",
+  "firmware": "badge-0.9.0",
   "uptime_seconds": 117,
   "free_heap_bytes": 227708,
   "free_psram_bytes": 8372404,
@@ -101,7 +101,8 @@
 `/status.voice` 与 `GET /voice` 返回相同状态，含阶段、问题/回答、错误、耗时、
 搜索次数和构建配置摘要，不含 API 密钥。`volume` 为当前音量，`default_volume` 为构建默认值，
 `volume_error` 为独立的音量设置错误。`POST /voice/volume` 接受 `{"volume":60}`（0–100 整数），
-保存后重启保留，播放期间可调整。启动/停止/取消/文本问答等接口见
+保存后重启保留，播放期间可调整。`local_tool_calls`、`last_tool`、`last_tool_result` 报告本地读写工具调用。
+`POST /voice/ask` 可添加 `"speak":false` 静默验证问答与工具，不写入历史；设置工具仍会实际修改设备，关机工具仍会调度关机。启动/停止/取消/文本问答等接口见
 [语音 HTTP 调试](voice.md#http-调试)。
 
 ## 网络时间（`GET /status` 的 `time_sync` 字段）
@@ -192,3 +193,17 @@ v0.4.2 将上限从 24 调整为 128，修复实际面板上粒子几乎不可�
 
 屏保/熄屏时首次触摸只唤醒，BOOT 可直接唤醒并开始录音。PWR 手动熄屏后问答继续，状态变化不自动唤醒。
 屏保与测试程序说明见 [battery-monitor.md](battery-monitor.md)。
+
+## 用户延迟关机
+
+`GET /status` 的 `shutdown` 对象独立于低电保护：
+
+```json
+{"state":"countdown","remaining_seconds":10,"delay_seconds":10,"countdown_starts":"after_reply_completed","reason":""}
+```
+
+`state` 为 `idle`、`waiting_for_reply`、`countdown`、`cancelled`、`power_off_requested` 或 `failed`。
+`remaining_seconds` 在等待回答时为 10，倒计时阶段逐秒递减；取消或失败后为 0。仅支持 10 秒延时。
+`POST /shutdown/cancel`（可发送 `{}`）取消关机并返回此对象；等待回答时也会取消当前对话。重复取消返回当前状态，HTTP 200。
+`POST /voice/cancel` 和 `/voice/reset` 同样撤销尚未执行的关机。
+关机计划绑定发起它的对话；新对话自动撤销旧计划。`power_off_requested` 仅代表 PMU 写入成功；如果设备 2 秒后仍运行，转为 `failed`，原因 `power_off_not_completed`。

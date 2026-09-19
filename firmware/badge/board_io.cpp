@@ -422,7 +422,7 @@ PowerOffResult boardPowerOffIfLow(uint16_t thresholdMv) {
   // A final fresh interlock: do not power off after USB insertion, a failed
   // read, battery removal or voltage recovery. STATUS1 bit5 gates even VBUS
   // which has not yet become a valid input according to STATUS2.
-  uint8_t status1, raw[2], config;
+  uint8_t status1, raw[2];
   if (!i2cRead(AXP2101_ADDR, AXP_REG_STATUS1, &status1, 1) ||
       !(status1 & 0x08) || (status1 & 0x20) ||
       !i2cRead(AXP2101_ADDR, AXP_REG_VBAT_H, raw, 2))
@@ -430,6 +430,11 @@ PowerOffResult boardPowerOffIfLow(uint16_t thresholdMv) {
   uint16_t mv = ((raw[0] & 0x1F) << 8) | raw[1];
   if (mv < 2000 || mv > thresholdMv)
     return PowerOffResult::Cancelled;
+  return boardPowerOff();
+}
+
+PowerOffResult boardPowerOff() {
+  uint8_t config;
   // XPowersAXP2101::shutdown(): COMMON_CONFIG (0x10), bit0.
   if (!i2cRead(AXP2101_ADDR, 0x10, &config, 1) ||
       !i2cWriteReg(AXP2101_ADDR, 0x10, config | 0x01))
@@ -441,8 +446,13 @@ void boardSetVisualActive(bool active) { imuInterval = active ? 40 : 200; }
 
 BoardMotion boardMotion() {
   BoardMotion m;
+  m.sampleAgeMs = uint32_t(millis() - lastImu);
+  m.temperatureAgeMs = lastTemperature ? uint32_t(millis() - lastTemperature) : UINT32_MAX;
   m.valid = imuOnline && uint32_t(millis() - lastImu) < 500;
-  if (m.valid) { m.ax = accelG[0]; m.ay = accelG[1]; m.az = accelG[2]; m.gz = gyroDps[2]; }
+  if (m.valid) {
+    m.ax = accelG[0]; m.ay = accelG[1]; m.az = accelG[2];
+    m.gx = gyroDps[0]; m.gy = gyroDps[1]; m.gz = gyroDps[2];
+  }
   m.temperatureValid = temperatureOK && uint32_t(millis() - lastTemperature) < 5000;
   if (m.temperatureValid) m.temperatureC = temperatureC;
   return m;
